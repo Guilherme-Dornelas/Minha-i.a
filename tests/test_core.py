@@ -68,6 +68,15 @@ class DatabaseTests(unittest.TestCase):
 
 
 class DocumentTests(unittest.TestCase):
+    def test_embeddings_use_a_short_model_lifetime(self):
+        response = Mock()
+        response.json.return_value = {"embeddings": [[1.0, 0.0]]}
+        response.raise_for_status.return_value = None
+        post = Mock(return_value=response)
+
+        self.assertEqual(documents.generate_embeddings(["consulta"], post=post), [[1.0, 0.0]])
+        self.assertEqual(post.call_args.kwargs["json"]["keep_alive"], "30s")
+
     def test_chunking_has_overlap_and_respects_limits(self):
         text = "palavra " * 300
         chunks = split_text(text, size=100, overlap=20)

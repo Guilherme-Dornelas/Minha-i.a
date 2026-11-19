@@ -141,7 +141,7 @@ def generate_embeddings(
         return []
     response = post(
         EMBED_URL,
-        json={"model": EMBED_MODEL, "input": texts},
+        json={"model": EMBED_MODEL, "input": texts, "keep_alive": "30s"},
         timeout=300,
     )
     response.raise_for_status()
