@@ -66,7 +66,54 @@ def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
     return chunks
 
 
-def _read_document(path: Path) -> str:
+def _ocr_pdf(path: Path, page_numbers: list[int]) -> dict[int, str]:
+    try:
+        import pypdfium2 as pdfium
+        import pytesseract
+    except ImportError as error:
+        raise DocumentError(
+            "OCR requer dependências opcionais. Instale com "
+            "'.venv\\Scripts\\python.exe -m pip install -r requirements-ocr.txt' "
+            "e instale o Tesseract OCR no sistema."
+        ) from error
+
+    try:
+        document = pdfium.PdfDocument(str(path))
+        pages = {}
+        try:
+            if len(page_numbers) > 100 or any(
+                page_number < 0 or page_number >= len(document)
+                for page_number in page_numbers
+            ):
+                raise DocumentError("O OCR aceita até 100 páginas válidas por vez.")
+            for page_number in page_numbers:
+                page = document[page_number]
+                try:
+                    bitmap = page.render(scale=2)
+                    try:
+                        image = bitmap.to_pil()
+                        try:
+                            pages[page_number] = pytesseract.image_to_string(image, lang="por+eng")
+                        finally:
+                            image.close()
+                    finally:
+                        bitmap.close()
+                finally:
+                    page.close()
+        finally:
+            document.close()
+    except DocumentError:
+        raise
+    except pytesseract.TesseractNotFoundError as error:
+        raise DocumentError(
+            "Tesseract OCR não foi encontrado. Instale-o e adicione-o ao PATH."
+        ) from error
+    except Exception as error:
+        raise DocumentError(f"Falha ao executar OCR local no PDF: {error}") from error
+    return pages
+
+
+def _read_document(path: Path, enable_ocr: bool = False) -> str:
     if path.suffix.lower() == ".txt":
         try:
             return path.read_text(encoding="utf-8")
@@ -94,12 +141,25 @@ def _read_document(path: Path) -> str:
     except Exception as error:
         raise DocumentError(f"Não foi possível ler o PDF: {error}") from error
 
+    if enable_ocr:
+        image_pages = [
+            page_number for page_number, page_text in enumerate(pages)
+            if not page_text.strip()
+        ]
+        if image_pages:
+            recognized_pages = _ocr_pdf(path, image_pages)
+            pages = [
+                recognized_pages.get(page_number, page_text)
+                for page_number, page_text in enumerate(pages)
+            ]
     text = "\n".join(pages).strip()
     if not text:
-        raise DocumentError(
-            "O PDF não contém texto extraível; pode ser digitalizado como imagem. "
-            "OCR não é executado automaticamente."
-        )
+        if not enable_ocr:
+            raise DocumentError(
+                "O PDF não contém texto extraível; pode ser digitalizado como imagem. "
+                "Ative a opção de OCR para processá-lo localmente."
+            )
+        raise DocumentError("O OCR não encontrou texto legível no PDF.")
     return text
 
 
@@ -179,6 +239,7 @@ def index_document(
     connection: sqlite3.Connection,
     file_path: str | Path,
     force: bool = False,
+    enable_ocr: bool = False,
 ) -> dict[str, Any]:
     path = resolve_library_file(file_path)
     if not path.is_file():
@@ -197,7 +258,7 @@ def index_document(
             "chunks": 0,
         }
 
-    text = _read_document(path)
+    text = _read_document(path, enable_ocr=enable_ocr)
     chunks = split_text(text)
     if not chunks:
         raise DocumentError("O documento está vazio e não foi indexado.")

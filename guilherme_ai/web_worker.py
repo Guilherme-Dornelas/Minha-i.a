@@ -3,7 +3,14 @@ import logging
 import sys
 from typing import Any
 
-from .assistant import _build_system_prompt
+from .assistant import (
+    AssistantError,
+    _build_system_prompt,
+    append_web_search_tool_result,
+    classify_web_search_intent,
+    fetch_relevant_web_pages,
+    search_web_intent,
+)
 from .analysis import analyze_project, analyze_spreadsheet, create_spreadsheet
 from .config import MAX_CONTEXT_MESSAGES
 from .database import (
@@ -24,7 +31,22 @@ from .documents import (
     remove_document,
     search_library,
 )
-from .tools import calculate, current_datetime, extract_authorized_filename
+from .gmail import (
+    GmailIntent,
+    classify_gmail_intent,
+    compose_email_draft,
+    parse_gmail_api_message,
+    validate_gmail_message_id,
+)
+from .tools import (
+    WebSearchError,
+    WebFetchError,
+    calculate,
+    current_datetime,
+    extract_authorized_filename,
+    web_fetch,
+    web_search,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +69,11 @@ def _ensure_web_schema(connection: Any) -> None:
             role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
             content TEXT NOT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS gmail_credentials (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            encrypted_payload TEXT NOT NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
         """
     )
@@ -104,6 +131,51 @@ def _run_action(request: dict[str, Any]) -> Any:
         _ensure_web_schema(connection)
         action = request.get("action")
 
+        if action == "gmail_parse_message":
+            message = request.get("message")
+            return parse_gmail_api_message(message)
+
+        if action == "gmail_compose":
+            prompt = request.get("prompt")
+            original_message = request.get("originalMessage")
+            if not isinstance(prompt, str):
+                raise ValueError("Informe a solicitação para preparar o e-mail.")
+            if original_message is not None and not isinstance(original_message, dict):
+                raise ValueError("O contexto do e-mail original é inválido.")
+            return compose_email_draft(prompt, original_message)
+
+        if action == "gmail_credentials_load":
+            row = connection.execute(
+                "SELECT encrypted_payload FROM gmail_credentials WHERE id = 1"
+            ).fetchone()
+            return {"encryptedPayload": row["encrypted_payload"] if row else None}
+
+        if action == "gmail_credentials_store":
+            encrypted_payload = request.get("encryptedPayload")
+            if (
+                not isinstance(encrypted_payload, str)
+                or not encrypted_payload
+                or len(encrypted_payload) > 10_000
+            ):
+                raise ValueError("Credenciais Gmail criptografadas inválidas.")
+            connection.execute(
+                """
+                INSERT INTO gmail_credentials (id, encrypted_payload)
+                VALUES (1, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    encrypted_payload = excluded.encrypted_payload,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (encrypted_payload,),
+            )
+            connection.commit()
+            return {"stored": True}
+
+        if action == "gmail_credentials_delete":
+            connection.execute("DELETE FROM gmail_credentials WHERE id = 1")
+            connection.commit()
+            return {"deleted": True}
+
         if action == "conversations":
             return _serialize_rows(connection.execute(
                 """
@@ -152,6 +224,18 @@ def _run_action(request: dict[str, Any]) -> Any:
             conversation_id = _conversation_id(request)
             _conversation_exists(connection, conversation_id)
             prompt = question.strip()
+            search_intent = classify_web_search_intent(prompt)
+            gmail_message_id = request.get("gmailMessageId")
+            if gmail_message_id is not None:
+                gmail_intent = GmailIntent(
+                    "reply",
+                    message_id=validate_gmail_message_id(gmail_message_id),
+                    max_results=1,
+                )
+            else:
+                gmail_intent = classify_gmail_intent(prompt)
+            web_sources = search_web_intent(search_intent, search=web_search)
+            web_pages, fetch_errors = fetch_relevant_web_pages(prompt, web_sources)
             sources = search_library(connection, prompt) if use_library else []
             memories = relevant_memories(connection, prompt)
             history = connection.execute(
@@ -161,17 +245,43 @@ def _run_action(request: dict[str, Any]) -> Any:
                 """,
                 (conversation_id, MAX_CONTEXT_MESSAGES),
             ).fetchall()
-            messages = [{"role": "system", "content": _build_system_prompt(memories, sources)}]
+            messages = [{
+                "role": "system",
+                "content": _build_system_prompt(
+                    memories,
+                    sources,
+                    web_sources,
+                    search_intent.resolved_dates,
+                    web_pages,
+                    fetch_errors,
+                    search_intent.required,
+                ),
+            }]
             messages.extend(
                 {"role": row["role"], "content": row["content"]}
                 for row in reversed(history)
             )
             messages.append({"role": "user", "content": prompt})
+            if web_sources or web_pages or fetch_errors:
+                append_web_search_tool_result(
+                    messages,
+                    (search_intent.query, *search_intent.related_queries),
+                    web_sources,
+                    web_pages,
+                    fetch_errors,
+                )
             return {
                 "conversationId": conversation_id,
                 "question": prompt,
                 "messages": messages,
                 "sources": sources,
+                "webSources": web_sources,
+                "gmailIntent": {
+                    "action": gmail_intent.action,
+                    "query": gmail_intent.query,
+                    "messageId": gmail_intent.message_id,
+                    "maxResults": gmail_intent.max_results,
+                },
             }
 
         if action == "save_chat":
@@ -249,7 +359,10 @@ def _run_action(request: dict[str, Any]) -> Any:
 
         if action == "index_document":
             filename = extract_authorized_filename(str(request.get("filename", "")))
-            return index_document(connection, filename)
+            enable_ocr = request.get("enableOcr", False)
+            if not isinstance(enable_ocr, bool):
+                raise ValueError("A opção de OCR é inválida.")
+            return index_document(connection, filename, enable_ocr=enable_ocr)
 
         if action == "reindex_library":
             return index_library(connection, force=True)
@@ -269,6 +382,10 @@ def _run_action(request: dict[str, Any]) -> Any:
                 return {"result": calculate(value)}
             if name == "datetime":
                 return {"result": current_datetime()}
+            if name == "web_search" and isinstance(value, str):
+                return {"result": web_search(value)}
+            if name == "web_fetch" and isinstance(value, str):
+                return {"result": web_fetch(value)}
             raise ValueError("Ferramenta desconhecida ou entrada inválida.")
 
         if action == "analyze_spreadsheet":
@@ -281,11 +398,14 @@ def _run_action(request: dict[str, Any]) -> Any:
             filename = request.get("filename")
             columns = request.get("columns")
             rows = request.get("rows")
-            if (
-                not isinstance(filename, str)
-                or not isinstance(columns, list)
-                or not isinstance(rows, list)
-            ):
+            sheets = request.get("sheets")
+            if not isinstance(filename, str):
+                raise ValueError("Informe o nome do arquivo para criar a planilha.")
+            if sheets is not None:
+                if not isinstance(sheets, list):
+                    raise ValueError("As abas da planilha são inválidas.")
+                return create_spreadsheet(filename, sheets=sheets)
+            if not isinstance(columns, list) or not isinstance(rows, list):
                 raise ValueError("Informe nome, colunas e linhas para criar a planilha.")
             return create_spreadsheet(filename, columns, rows)
 
@@ -306,12 +426,18 @@ def main() -> None:
         if not isinstance(request, dict):
             raise ValueError("Requisição inválida.")
         result = _run_action(request)
-        print(json.dumps({"ok": True, "result": result}, ensure_ascii=False))
+        print(json.dumps({"ok": True, "result": result}, ensure_ascii=True))
     except (ValueError, DocumentError) as error:
-        print(json.dumps({"ok": False, "error": str(error), "status": 400}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "error": str(error), "status": 400}, ensure_ascii=True))
+    except WebSearchError as error:
+        print(json.dumps({"ok": False, "error": str(error), "status": 503}, ensure_ascii=True))
+    except WebFetchError as error:
+        print(json.dumps({"ok": False, "error": str(error), "status": 502}, ensure_ascii=True))
+    except AssistantError as error:
+        print(json.dumps({"ok": False, "error": str(error), "status": 502}, ensure_ascii=True))
     except Exception as error:
         logger.exception("Falha no worker web.")
-        print(json.dumps({"ok": False, "error": str(error), "status": 500}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "error": str(error), "status": 500}, ensure_ascii=True))
 
 
 if __name__ == "__main__":

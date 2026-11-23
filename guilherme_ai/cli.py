@@ -18,7 +18,12 @@ from .database import (
     save_note,
 )
 from .documents import DocumentError, index_document, index_library, list_documents, remove_document
-from .tools import ToolError, create_registry, extract_authorized_filename
+from .tools import (
+    ToolError,
+    WebSearchError,
+    create_registry,
+    extract_authorized_filename,
+)
 from .voice import VoiceError, listen_once, speak
 
 logger = logging.getLogger(__name__)
@@ -39,6 +44,7 @@ COMANDOS
   /limpar                        Limpa apenas o histórico de conversa após confirmação.
   /calc expressão                Calculadora aritmética segura.
   /hora                          Consulta data e hora locais.
+  /pesquisar consulta            Pesquisa na internet via SearXNG local.
   /ferramentas                   Lista ferramentas locais disponíveis.
   /resumir assunto               Resume informações relevantes da biblioteca.
   /nota texto                    Salva uma nota.
@@ -139,6 +145,12 @@ def _handle_command(connection: sqlite3.Connection, command: str) -> bool:
             print(error)
     elif lowered == "/hora":
         print(TOOL_REGISTRY.run("data_hora"))
+    elif lowered == "/pesquisar" or lowered.startswith("/pesquisar "):
+        query = command[len("/pesquisar"):].strip()
+        try:
+            print(TOOL_REGISTRY.run("web_search", query))
+        except (ToolError, WebSearchError) as error:
+            print(f"Erro na pesquisa: {error}")
     elif lowered == "/ferramentas":
         for tool in TOOL_REGISTRY.available():
             print(f"{tool.name}: {tool.description}")
@@ -153,7 +165,8 @@ def _handle_command(connection: sqlite3.Connection, command: str) -> bool:
             )
             print(f"\nGuilherme AI: {result.answer}")
             _show_sources(result.sources)
-        except (AssistantError, DocumentError, requests.RequestException) as error:
+            _show_web_sources(result.web_sources)
+        except (AssistantError, DocumentError, WebSearchError, requests.RequestException) as error:
             print(f"Erro ao resumir: {error}")
     elif lowered.startswith("/nota "):
         content = command[len("/nota"):].strip()
@@ -203,8 +216,9 @@ def _voice_turn(connection: sqlite3.Connection) -> None:
         result = chat(connection, question)
         print(f"\nGuilherme AI: {result.answer}")
         _show_sources(result.sources)
+        _show_web_sources(result.web_sources)
         speak(result.answer)
-    except (VoiceError, AssistantError, DocumentError, requests.RequestException) as error:
+    except (VoiceError, AssistantError, DocumentError, WebSearchError, requests.RequestException) as error:
         print(f"Recurso de voz/conversa indisponível: {error}")
     except OSError as error:
         print(f"Falha de áudio ou arquivo: {error}")
@@ -218,6 +232,17 @@ def _show_sources(sources: list[dict]) -> None:
     for index, source in enumerate(sources, start=1):
         print(f"[{index}] {source['source']} (similaridade {source['score']:.3f})")
         print(f"    {source['content']}")
+
+
+def _show_web_sources(sources: list[dict[str, str]]) -> None:
+    if not sources:
+        return
+    print("\nFontes da internet:")
+    for index, source in enumerate(sources, start=1):
+        print(f"[W{index}] {source['title']}")
+        print(f"    {source['url']}")
+        if source["description"]:
+            print(f"    {source['description']}")
 
 
 def run_cli() -> None:
@@ -239,7 +264,7 @@ def run_cli() -> None:
                 try:
                     if not _handle_command(connection, prompt):
                         break
-                except (DocumentError, OSError, requests.RequestException) as error:
+                except (DocumentError, WebSearchError, OSError, requests.RequestException) as error:
                     logger.exception("Falha em comando da biblioteca.")
                     print(f"Erro: {error}")
                 continue
@@ -247,7 +272,8 @@ def run_cli() -> None:
                 result = chat(connection, prompt)
                 print(f"\nGuilherme AI: {result.answer}")
                 _show_sources(result.sources)
-            except (AssistantError, DocumentError, requests.RequestException) as error:
+                _show_web_sources(result.web_sources)
+            except (AssistantError, DocumentError, WebSearchError, requests.RequestException) as error:
                 print(f"Erro: {error}")
     finally:
         connection.close()

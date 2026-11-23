@@ -10,12 +10,16 @@ import {
   Clock3,
   Copy,
   Download,
+  Eye,
   FileText,
   FileSpreadsheet,
   FlaskConical,
   FolderOpen,
   Hash,
   History,
+  Inbox,
+  LogIn,
+  LogOut,
   LoaderCircle,
   Mail,
   Menu,
@@ -24,6 +28,7 @@ import {
   MoreHorizontal,
   Plus,
   Search,
+  Send,
   Settings,
   ShieldCheck,
   Sparkles,
@@ -38,11 +43,62 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 type Page = "chat" | "library" | "memories" | "notes" | "tools" | "settings" | "email";
+type WebSource = { title: string; url: string; description: string };
+type GmailStatus = { configured: boolean; connected: boolean; email: string | null };
+type GmailMessageSummary = {
+  id: string;
+  threadId: string;
+  from: string;
+  to: string;
+  subject: string;
+  date: string;
+  snippet: string;
+  unread: boolean;
+};
+type GmailMessage = GmailMessageSummary & {
+  cc: string;
+  fromAddress: string;
+  body: string;
+  messageId: string;
+  inReplyTo: string;
+  references: string;
+};
+type GmailDraft = {
+  to: string;
+  cc: string;
+  bcc: string;
+  subject: string;
+  body: string;
+  threadId?: string;
+  inReplyTo?: string;
+  references?: string;
+};
+type GmailChatData = {
+  error?: string;
+  messages?: GmailMessageSummary[];
+  originalMessage?: GmailMessage;
+  from?: string;
+  to?: string;
+  subject?: string;
+  date?: string;
+  body?: string;
+};
+type GmailPreview = {
+  previewId: string;
+  to: string;
+  cc: string;
+  bcc: string;
+  subject: string;
+  body: string;
+};
 type Message = {
   id: number | string;
   role: "user" | "assistant";
   content: string;
   sources?: Array<{ source: string; content: string; score: number }>;
+  webSources?: WebSource[];
+  gmailData?: GmailChatData;
+  gmailDraft?: GmailDraft;
   loading?: boolean;
 };
 type Conversation = { id: number; title: string; is_default: number; updated_at: string };
@@ -78,6 +134,10 @@ type ProjectReport = {
   technologies: string[];
   extensions: Record<string, number>;
   recommendations: string[];
+  pythonFilesChecked: number;
+  pythonFilesSkipped: number;
+  pythonSyntaxErrors: Array<{ file: string; line: number | null; message: string }>;
+  pythonSyntaxErrorsTruncated: boolean;
   sensitiveFilesSkipped: number;
   contentsSentToModel: boolean;
   codeExecuted: boolean;
@@ -115,6 +175,7 @@ function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [question, setQuestion] = useState("");
   const [useLibrary, setUseLibrary] = useState(true);
+  const [ocrScans, setOcrScans] = useState(false);
   const [health, setHealth] = useState<Health | null>(null);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [memories, setMemories] = useState<Memory[]>([]);
@@ -126,10 +187,31 @@ function App() {
   const [spreadsheetReport, setSpreadsheetReport] = useState<SheetReport | null>(null);
   const [spreadsheetName, setSpreadsheetName] = useState("relatorio.xlsx");
   const [spreadsheetJson, setSpreadsheetJson] = useState(
-    JSON.stringify({ columns: ["Item", "Quantidade"], rows: [["Exemplo", 1]] }, null, 2),
+    JSON.stringify({
+      sheets: [{
+        name: "Dados",
+        columns: ["Item", "Quantidade"],
+        rows: [["Exemplo", 1]],
+      }],
+    }, null, 2),
   );
   const [projectDirectory, setProjectDirectory] = useState("");
   const [projectReport, setProjectReport] = useState<ProjectReport | null>(null);
+  const [gmailStatus, setGmailStatus] = useState<GmailStatus | null>(null);
+  const [gmailMessages, setGmailMessages] = useState<GmailMessageSummary[]>([]);
+  const [gmailNextPageToken, setGmailNextPageToken] = useState<string | null>(null);
+  const [selectedGmailMessage, setSelectedGmailMessage] = useState<GmailMessage | null>(null);
+  const [gmailQuery, setGmailQuery] = useState("in:inbox");
+  const [gmailTo, setGmailTo] = useState("");
+  const [gmailCc, setGmailCc] = useState("");
+  const [gmailBcc, setGmailBcc] = useState("");
+  const [gmailSubject, setGmailSubject] = useState("");
+  const [gmailBody, setGmailBody] = useState("");
+  const [gmailThreadId, setGmailThreadId] = useState("");
+  const [gmailInReplyTo, setGmailInReplyTo] = useState("");
+  const [gmailReferences, setGmailReferences] = useState("");
+  const [gmailPreview, setGmailPreview] = useState<GmailPreview | null>(null);
+  const [gmailBusy, setGmailBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
@@ -165,9 +247,9 @@ function App() {
     return data;
   }, []);
 
-  const selectConversation = useCallback(async (id: number) => {
+  const selectConversation = useCallback(async (id: number, showChat = true) => {
     setConversationId(id);
-    setPage("chat");
+    if (showChat) setPage("chat");
     setError("");
     const data = await api<Array<Omit<Message, "sources">>>(`/api/conversations/${id}/messages`);
     setMessages(data.map((message) => ({ ...message, role: message.role as Message["role"] })));
@@ -179,7 +261,7 @@ function App() {
     void refreshConversations()
       .then(async (items) => {
         const selected = items[0] ?? await api<Conversation>("/api/conversations", { method: "POST" });
-        if (selected) await selectConversation(selected.id);
+        if (selected) await selectConversation(selected.id, false);
       })
       .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : "Não foi possível iniciar."));
     return () => window.clearInterval(timer);
@@ -189,15 +271,43 @@ function App() {
     messageEnd.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages]);
 
+  const loadGmailMessages = useCallback(async (
+    query: string,
+    pageToken?: string,
+    append = false,
+  ) => {
+    const parameters = new URLSearchParams({ q: query, limit: "10" });
+    if (pageToken) parameters.set("pageToken", pageToken);
+    const result = await api<{
+      messages: GmailMessageSummary[];
+      nextPageToken: string | null;
+      resultSizeEstimate: number;
+    }>(`/api/gmail/messages?${parameters.toString()}`);
+    setGmailMessages((current) => append ? [...current, ...result.messages] : result.messages);
+    setGmailNextPageToken(result.nextPageToken);
+  }, []);
+
+  const refreshGmail = useCallback(async () => {
+    const status = await api<GmailStatus>("/api/gmail/status");
+    setGmailStatus(status);
+    if (status.connected) await loadGmailMessages(gmailQuery);
+    else {
+      setGmailMessages([]);
+      setGmailNextPageToken(null);
+      setSelectedGmailMessage(null);
+    }
+  }, [gmailQuery, loadGmailMessages]);
+
   const refreshPageData = useCallback(async (target: Page) => {
     try {
       if (target === "library") setDocuments(await api<DocumentItem[]>("/api/documents"));
       if (target === "memories") setMemories(await api<Memory[]>("/api/memories"));
       if (target === "notes") setNotes(await api<Note[]>("/api/notes"));
+      if (target === "email") await refreshGmail();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Falha ao carregar os dados.");
     }
-  }, []);
+  }, [refreshGmail]);
 
   const navigate = (target: Page) => {
     setPage(target);
@@ -223,7 +333,7 @@ function App() {
     }
   };
 
-  const sendMessage = async (value: string) => {
+  const sendMessage = async (value: string, gmailMessageId?: string) => {
     const trimmed = value.trim();
     if (!trimmed || busy || !conversationId) return;
     setError("");
@@ -242,7 +352,12 @@ function App() {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ question: trimmed, conversationId, useLibrary }),
+        body: JSON.stringify({
+          question: trimmed,
+          conversationId,
+          useLibrary,
+          ...(gmailMessageId ? { gmailMessageId } : {}),
+        }),
       });
       if (!response.ok || !response.body) {
         const body = await response.json().catch(() => ({})) as { error?: string };
@@ -265,13 +380,24 @@ function App() {
           token?: string;
           answer?: string;
           sources?: Message["sources"];
+          webSources?: WebSource[];
+          gmailData?: GmailChatData;
+          gmailDraft?: GmailDraft;
           error?: string;
         };
         if (eventName === "error") throw new Error(event.error || "Falha ao gerar a resposta.");
         if (eventName === "done") {
           completed = true;
           setMessages((current) => current.map((message) => message.id === assistantId
-            ? { ...message, content: event.answer ?? message.content, sources: event.sources, loading: false }
+            ? {
+              ...message,
+              content: event.answer ?? message.content,
+              sources: event.sources,
+              webSources: event.webSources,
+              gmailData: event.gmailData,
+              gmailDraft: event.gmailDraft,
+              loading: false,
+            }
             : message));
           return;
         }
@@ -300,6 +426,147 @@ function App() {
     } finally {
       setBusy(false);
     }
+  };
+
+  const searchGmail = async (event: FormEvent) => {
+    event.preventDefault();
+    setError("");
+    setGmailBusy(true);
+    setSelectedGmailMessage(null);
+    setGmailNextPageToken(null);
+    try {
+      await loadGmailMessages(gmailQuery.trim() || "in:inbox");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível pesquisar o Gmail.");
+    } finally {
+      setGmailBusy(false);
+    }
+  };
+
+  const loadMoreGmail = async () => {
+    if (!gmailNextPageToken) return;
+    setError("");
+    setGmailBusy(true);
+    try {
+      await loadGmailMessages(gmailQuery, gmailNextPageToken, true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível carregar mais mensagens.");
+    } finally {
+      setGmailBusy(false);
+    }
+  };
+
+  const openGmailMessage = async (messageId: string) => {
+    setError("");
+    setGmailBusy(true);
+    try {
+      setSelectedGmailMessage(await api<GmailMessage>(`/api/gmail/messages/${encodeURIComponent(messageId)}`));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível abrir a mensagem.");
+    } finally {
+      setGmailBusy(false);
+    }
+  };
+
+  const disconnectGmail = async () => {
+    if (!window.confirm("Desconectar a conta e remover as credenciais locais?")) return;
+    setError("");
+    setGmailBusy(true);
+    try {
+      const result = await api<{ remoteRevoked: boolean }>("/api/gmail/disconnect", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      setGmailStatus({ configured: gmailStatus?.configured ?? false, connected: false, email: null });
+      setGmailMessages([]);
+      setSelectedGmailMessage(null);
+      setGmailPreview(null);
+      setNotice(result.remoteRevoked
+        ? "Conta desconectada, credenciais locais removidas e acesso Google revogado."
+        : "Credenciais locais removidas; não foi possível confirmar a revogação no Google.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível desconectar o Gmail.");
+    } finally {
+      setGmailBusy(false);
+    }
+  };
+
+  const createGmailPreview = async (event: FormEvent) => {
+    event.preventDefault();
+    setError("");
+    setGmailBusy(true);
+    try {
+      const preview = await api<GmailPreview>("/api/gmail/send/preview", {
+        method: "POST",
+        body: JSON.stringify({
+          to: gmailTo,
+          cc: gmailCc,
+          bcc: gmailBcc,
+          subject: gmailSubject,
+          body: gmailBody,
+          ...(gmailThreadId ? { threadId: gmailThreadId } : {}),
+          ...(gmailInReplyTo ? { inReplyTo: gmailInReplyTo } : {}),
+          ...(gmailReferences ? { references: gmailReferences } : {}),
+        }),
+      });
+      setGmailPreview(preview);
+      setNotice("Confira os destinatários e o conteúdo antes de confirmar o envio.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível preparar a prévia.");
+    } finally {
+      setGmailBusy(false);
+    }
+  };
+
+  const confirmGmailSend = async () => {
+    if (!gmailPreview) return;
+    setError("");
+    setGmailBusy(true);
+    try {
+      const sent = await api<{ id: string }>("/api/gmail/send/" + encodeURIComponent(gmailPreview.previewId) + "/confirm", {
+        method: "POST",
+        body: JSON.stringify({ confirmed: true }),
+      });
+      setGmailPreview(null);
+      setGmailTo("");
+      setGmailCc("");
+      setGmailBcc("");
+      setGmailSubject("");
+      setGmailBody("");
+      setGmailThreadId("");
+      setGmailInReplyTo("");
+      setGmailReferences("");
+      setNotice(`E-mail enviado. Identificador: ${sent.id}`);
+      try {
+        await loadGmailMessages(gmailQuery);
+      } catch {
+        setNotice(`E-mail enviado. Identificador: ${sent.id}. Não foi possível atualizar a lista.`);
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível enviar o e-mail.");
+    } finally {
+      setGmailBusy(false);
+    }
+  };
+
+  const useGmailDraft = (draft: GmailDraft) => {
+    setGmailTo(draft.to);
+    setGmailCc(draft.cc);
+    setGmailBcc(draft.bcc);
+    setGmailSubject(draft.subject);
+    setGmailBody(draft.body);
+    setGmailThreadId(draft.threadId ?? "");
+    setGmailInReplyTo(draft.inReplyTo ?? "");
+    setGmailReferences(draft.references ?? "");
+    setGmailPreview(null);
+    navigate("email");
+    setNotice("Rascunho carregado para revisão. O envio exige uma confirmação separada.");
+  };
+
+  const replyToSelectedGmailMessage = () => {
+    if (!selectedGmailMessage) return;
+    setPage("chat");
+    void sendMessage("Prepare uma resposta para esta mensagem do Gmail.", selectedGmailMessage.id);
   };
 
   const submitMessage = (event: FormEvent) => {
@@ -336,7 +603,10 @@ function App() {
       });
       const result = await api<{ status: string }>("/api/documents/index", {
         method: "POST",
-        body: JSON.stringify({ filename: file.name }),
+        body: JSON.stringify({
+          filename: file.name,
+          enableOcr: ocrScans && file.name.toLowerCase().endsWith(".pdf"),
+        }),
       });
       setNotice(result.status === "indexed" ? `${file.name} enviado e indexado.` : `${file.name}: ${result.status}.`);
       await refreshPageData("library");
@@ -433,19 +703,27 @@ function App() {
     setError("");
     setNotice("");
     try {
-      const data = JSON.parse(spreadsheetJson) as { columns?: unknown; rows?: unknown };
-      if (!Array.isArray(data.columns) || !Array.isArray(data.rows)) {
-        throw new Error("O JSON precisa ter as listas columns e rows.");
+      const data = JSON.parse(spreadsheetJson) as {
+        sheets?: unknown;
+        columns?: unknown;
+        rows?: unknown;
+      };
+      let payload: Record<string, unknown>;
+      if (Array.isArray(data.sheets)) {
+        payload = { sheets: data.sheets };
+      } else if (Array.isArray(data.columns) && Array.isArray(data.rows)) {
+        payload = { columns: data.columns, rows: data.rows };
+      } else {
+        throw new Error("O JSON precisa ter sheets ou as listas columns e rows.");
       }
-      const result = await api<{ filename: string }>("/api/spreadsheets/create", {
+      const result = await api<{ filename: string; sheets: string[]; charts: number }>("/api/spreadsheets/create", {
         method: "POST",
-        body: JSON.stringify({
-          filename: spreadsheetName,
-          columns: data.columns,
-          rows: data.rows,
-        }),
+        body: JSON.stringify({ filename: spreadsheetName, ...payload }),
       });
-      setNotice(`${result.filename} criado. Baixe-o abaixo.`);
+      setNotice(
+        `${result.filename} criado com ${result.sheets.length} aba(s) e `
+        + `${result.charts} gráfico(s). Baixe-o abaixo.`,
+      );
       setSpreadsheetReport({
         filename: result.filename,
         sheets: [],
@@ -526,9 +804,8 @@ function App() {
               <Icon size={17} /><span>{!collapsed && label}</span>
             </button>
           ))}
-          <button className={`nav-item ${page === "email" ? "active" : ""}`} onClick={() => navigate("email")} title="E-mail pendente">
+          <button className={`nav-item ${page === "email" ? "active" : ""}`} onClick={() => navigate("email")} title="Gmail">
             <Mail size={17} /><span>{!collapsed && "E-mail"}</span>
-            {!collapsed && <span className="nav-badge">Pendente</span>}
           </button>
         </div>
 
@@ -624,6 +901,67 @@ function App() {
                               ))}
                             </details>
                           )}
+                          {message.webSources && message.webSources.length > 0 && (
+                            <details className="sources-card web-sources-card">
+                              <summary><Search size={14} /> Fontes da internet <ChevronDown size={14} /></summary>
+                              {message.webSources.map((source, index) => (
+                                <div key={`${source.url}-${index}`} className="source-item">
+                                  <b>[W{index + 1}] <a href={source.url} target="_blank" rel="noopener noreferrer">{source.title}</a></b>
+                                  {source.description && <p>{source.description}</p>}
+                                  <small>{source.url}</small>
+                                </div>
+                              ))}
+                            </details>
+                          )}
+                          {message.gmailData?.error && (
+                            <div className="gmail-result-card" role="status">{message.gmailData.error}</div>
+                          )}
+                          {message.gmailData?.messages && message.gmailData.messages.length > 0 && (
+                            <div className="gmail-result-card">
+                              <strong><Inbox size={14} /> Mensagens encontradas</strong>
+                              {message.gmailData.messages.map((item) => (
+                                <button
+                                  key={item.id}
+                                  className="gmail-list-entry"
+                                  onClick={() => {
+                                    setPage("email");
+                                    void openGmailMessage(item.id);
+                                  }}
+                                >
+                                  <span>{item.from}</span>
+                                  <b>{item.subject || "(sem assunto)"}</b>
+                                  <small>{item.snippet}</small>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                          {(message.gmailData?.subject || message.gmailData?.originalMessage) && (
+                            <div className="gmail-result-card">
+                              <strong><Mail size={14} /> Mensagem consultada</strong>
+                              <b>{message.gmailData.originalMessage?.subject ?? message.gmailData.subject}</b>
+                              <small>
+                                {message.gmailData.originalMessage?.from ?? message.gmailData.from}
+                                {" · "}
+                                {message.gmailData.originalMessage?.date ?? message.gmailData.date}
+                              </small>
+                              {(message.gmailData.body || message.gmailData.originalMessage?.body) && (
+                                <pre className="gmail-body-preview">
+                                  {message.gmailData.originalMessage?.body ?? message.gmailData.body}
+                                </pre>
+                              )}
+                            </div>
+                          )}
+                          {message.gmailDraft && (
+                            <div className="gmail-draft-card">
+                              <strong><Mail size={14} /> Rascunho preparado para revisão</strong>
+                              <span><b>Para:</b> {message.gmailDraft.to || "adicione um destinatário"}</span>
+                              <span><b>Assunto:</b> {message.gmailDraft.subject || "(sem assunto)"}</span>
+                              <pre className="gmail-body-preview">{message.gmailDraft.body}</pre>
+                              <button className="primary-button" onClick={() => useGmailDraft(message.gmailDraft!)}>
+                                Revisar no Gmail
+                              </button>
+                            </div>
+                          )}
                         </div>
                       </article>
                     ))}
@@ -689,10 +1027,18 @@ function App() {
               <div className="upload-card">
                 <div className="upload-icon"><Upload size={20} /></div>
                 <h2>Importar um documento</h2>
-                <p>TXT ou PDF com texto extraível · até 20 MB · processado localmente</p>
+                <p>TXT ou PDF · até 20 MB · processado localmente</p>
                 <button className="primary-button" onClick={() => fileInput.current?.click()} disabled={uploading}>
                   {uploading ? <LoaderCircle className="spin" size={16} /> : <Plus size={17} />} Escolher arquivo
                 </button>
+                <label className="ocr-option">
+                  <input
+                    type="checkbox"
+                    checked={ocrScans}
+                    onChange={(event) => setOcrScans(event.target.checked)}
+                  />
+                  Tentar OCR em PDFs digitalizados (opcional)
+                </label>
                 <input ref={fileInput} type="file" accept=".txt,.pdf" hidden onChange={(event) => void uploadFile(event.target.files?.[0])} />
               </div>
               <div className="section-title"><h2>Documentos indexados</h2><button className="text-button" onClick={async () => {
@@ -718,7 +1064,7 @@ function App() {
                   </div>
                 ))}
               </div>
-              <p className="muted-note">PDFs digitalizados como imagem não têm OCR automático. O texto extraído permanece no banco local.</p>
+              <p className="muted-note">O OCR é opcional e local; requer Tesseract instalado e as dependências de requirements-ocr.txt. O texto extraído permanece no banco local.</p>
             </div>
           )}
 
@@ -787,14 +1133,14 @@ function App() {
                 <div className="section-title"><h2>Criar uma planilha</h2></div>
                 <form className="tool-card create-sheet-form" onSubmit={(event) => void createWorkbook(event)}>
                   <label>Nome do arquivo<input value={spreadsheetName} onChange={(event) => setSpreadsheetName(event.target.value)} maxLength={150} /></label>
-                  <label>Dados JSON (colunas e linhas)<textarea value={spreadsheetJson} onChange={(event) => setSpreadsheetJson(event.target.value)} spellCheck={false} /></label>
-                  <small className="muted-note">Exemplo: {"{ \"columns\": [\"Nome\", \"Valor\"], \"rows\": [[\"Item\", 10]] }"}. Arquivos existentes nunca são sobrescritos.</small>
+                  <label>Dados JSON (abas, colunas e linhas)<textarea value={spreadsheetJson} onChange={(event) => setSpreadsheetJson(event.target.value)} spellCheck={false} /></label>
+                  <small className="muted-note">Use {"{ \"sheets\": [{ \"name\": \"Vendas\", \"columns\": [\"Item\", \"Valor\"], \"rows\": [[\"A\", 10]] }] }"}. Também aceita o formato antigo columns/rows. Gera gráficos quando encontra categorias e valores numéricos. Arquivos existentes nunca são sobrescritos.</small>
                   <button className="primary-button" type="submit"><Plus size={15} /> Criar XLSX</button>
                 </form>
 
                 <div className="section-title"><h2>Analisar um projeto</h2></div>
                 <div className="tool-card">
-                  <div className="tool-card-heading"><div className="page-icon purple small"><FolderOpen size={16} /></div><div><h2>Inventário local</h2><p>Lê somente nomes e extensões. Ignora dependências e arquivos de credenciais; não abre nem executa o código.</p></div></div>
+                  <div className="tool-card-heading"><div className="page-icon purple small"><FolderOpen size={16} /></div><div><h2>Análise estática local</h2><p>Inventaria arquivos e verifica a sintaxe Python sem executar o código. Não envia conteúdo ao modelo.</p></div></div>
                   <form className="project-form" onSubmit={(event) => void analyzeProject(event)}>
                     <input value={projectDirectory} onChange={(event) => setProjectDirectory(event.target.value)} placeholder={"C:\\Users\\...\\MeuProjeto"} aria-label="Caminho da pasta do projeto" />
                     <button className="primary-button" type="submit" disabled={!projectDirectory.trim()}><Search size={15} /> Analisar</button>
@@ -806,13 +1152,23 @@ function App() {
                       <p>Tecnologias identificadas: {projectReport.technologies.join(", ") || "não detectadas pelos manifestos"}</p>
                       <div className="column-tags">{Object.entries(projectReport.extensions).map(([extension, count]) => <span key={extension}>{extension}: {count}</span>)}</div>
                       {projectReport.recommendations.length > 0 && <ul className="recommendations">{projectReport.recommendations.map((item) => <li key={item}>{item}</li>)}</ul>}
+                      <p>Sintaxe Python: {projectReport.pythonFilesChecked} arquivo(s) verificado(s), {projectReport.pythonSyntaxErrors.length} problema(s) exibido(s).</p>
+                      {projectReport.pythonFilesSkipped > 0 && <p className="muted-note">{projectReport.pythonFilesSkipped} arquivo(s) não verificado(s) para manter o limite local de recursos.</p>}
+                      {projectReport.pythonSyntaxErrorsTruncated && <p className="muted-note">A lista foi limitada a 100 problemas.</p>}
+                      {projectReport.pythonSyntaxErrors.length > 0 && <ul className="recommendations">{projectReport.pythonSyntaxErrors.map((item) => <li key={`${item.file}:${item.line}`}><b>{item.file}{item.line ? `:${item.line}` : ""}</b>: {item.message}</li>)}</ul>}
                       <small className="muted-note">{projectReport.sensitiveFilesSkipped} arquivo(s) com nome sensível ignorado(s). Conteúdo enviado ao modelo: não. Código executado: não.</small>
                     </div>
                   )}
                 </div>
 
                 <div className="section-title"><h2>Integrações externas</h2></div>
-                <div className="future-grid"><FutureCard icon={Search} title="Pesquisa na internet" text="Desativada para não enviar consultas sem autorização." /></div>
+                <div className="settings-card">
+                  <div className="settings-row">
+                    <div><strong>Pesquisa na internet</strong><small>Busca automática de informações atuais pelo SearXNG local.</small></div>
+                    <span className="setting-status"><Search size={14} /> Configurada</span>
+                  </div>
+                  <small className="muted-note">Os resultados externos podem estar incompletos ou desatualizados; a IA mostra os links usados.</small>
+                </div>
             </div>
           )}
 
@@ -832,18 +1188,128 @@ function App() {
 
           {page === "email" && (
             <div className="management-page">
-              <div className="page-heading"><div className="page-icon amber"><Mail size={19} /></div><div><h1>Consulta de e-mail</h1><p>Integração planejada para leitura, sem enviar ou alterar mensagens.</p></div></div>
-              <div className="pending-card"><div className="pending-icon"><ShieldCheck size={21} /></div><div><h2>Aguardando sua autorização</h2><p>Nenhuma conta foi conectada. A integração só será ativada depois da configuração manual do OAuth do Google e da sua autorização.</p><span className="scope-chip">Escopo previsto: gmail.readonly</span></div></div>
+              <div className="page-heading"><div className="page-icon amber"><Mail size={19} /></div><div><h1>Gmail</h1><p>Pesquise e leia mensagens; rascunhos só são enviados depois da sua confirmação.</p></div></div>
+              {!gmailStatus ? (
+                <div className="empty-card">Carregando o estado da integração Gmail…</div>
+              ) : !gmailStatus.configured ? (
+                <div className="pending-card">
+                  <div className="pending-icon"><ShieldCheck size={21} /></div>
+                  <div>
+                    <h2>Configure a autorização Google</h2>
+                    <p>
+                      Defina GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI,
+                      GMAIL_ALLOWED_EMAIL e GMAIL_TOKEN_ENCRYPTION_KEY no arquivo .env. O callback local deve ser
+                      http://127.0.0.1:8000/api/gmail/oauth/callback.
+                    </p>
+                    <span className="scope-chip">Escopos: gmail.readonly e gmail.send</span>
+                  </div>
+                </div>
+              ) : !gmailStatus.connected ? (
+                <div className="pending-card">
+                  <div className="pending-icon"><ShieldCheck size={21} /></div>
+                  <div>
+                    <h2>Conecte sua conta</h2>
+                    <p>O Google pedirá sua autorização. Os tokens serão criptografados antes de serem salvos localmente.</p>
+                    <button className="primary-button" onClick={() => window.location.assign("/api/gmail/oauth/start")}>
+                      <LogIn size={14} /> Conectar Gmail
+                    </button>
+                    <span className="scope-chip">Leitura e envio com confirmação explícita</span>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="settings-card gmail-account-card">
+                    <div className="settings-row">
+                      <div><strong>Conta conectada</strong><small>{gmailStatus.email}</small></div>
+                      <button className="subtle-button" disabled={gmailBusy} onClick={() => void disconnectGmail()}>
+                        <LogOut size={14} /> Desconectar
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="gmail-workspace">
+                    <section className="tool-card">
+                      <div className="tool-card-heading"><div className="page-icon small amber"><Inbox size={16} /></div><div><h2>Caixa de entrada</h2><p>Use filtros da pesquisa Gmail, por exemplo: from:alguem@example.com newer_than:7d</p></div></div>
+                      <form className="project-form gmail-search-form" onSubmit={(event) => void searchGmail(event)}>
+                        <input aria-label="Filtro de pesquisa Gmail" value={gmailQuery} onChange={(event) => setGmailQuery(event.target.value)} />
+                        <button className="primary-button" type="submit" disabled={gmailBusy}>
+                          {gmailBusy ? <LoaderCircle className="spin" size={14} /> : <Search size={14} />}
+                          Pesquisar
+                        </button>
+                      </form>
+                      <div className="gmail-message-list">
+                        {gmailMessages.length === 0
+                          ? <div className="empty-card">Nenhuma mensagem encontrada.</div>
+                          : gmailMessages.map((item) => (
+                            <button
+                              key={item.id}
+                              className={`gmail-message-row ${selectedGmailMessage?.id === item.id ? "selected" : ""}`}
+                              onClick={() => void openGmailMessage(item.id)}
+                              disabled={gmailBusy}
+                            >
+                              <span className="gmail-message-from">{item.unread ? "● " : ""}{item.from || "(remetente desconhecido)"}</span>
+                              <b>{item.subject || "(sem assunto)"}</b>
+                              <small>{item.snippet}</small>
+                              <time>{item.date}</time>
+                            </button>
+                          ))}
+                      </div>
+                      {gmailNextPageToken && (
+                        <button
+                          className="text-button"
+                          disabled={gmailBusy}
+                          onClick={() => void loadMoreGmail()}
+                        >
+                          Carregar mais mensagens
+                        </button>
+                      )}
+                      {selectedGmailMessage && (
+                        <article className="gmail-detail">
+                          <div className="gmail-detail-heading">
+                            <div><h3>{selectedGmailMessage.subject || "(sem assunto)"}</h3><small>De: {selectedGmailMessage.from}</small></div>
+                            <button className="text-button" onClick={replyToSelectedGmailMessage}>Preparar resposta com IA</button>
+                          </div>
+                          <small>Para: {selectedGmailMessage.to} · {selectedGmailMessage.date}</small>
+                          <pre className="gmail-body-preview">{selectedGmailMessage.body || selectedGmailMessage.snippet}</pre>
+                        </article>
+                      )}
+                    </section>
+
+                    <section className="tool-card">
+                      <div className="tool-card-heading"><div className="page-icon small blue"><Send size={16} /></div><div><h2>Compor e-mail</h2><p>Revise todos os campos; o envio não é feito ao gerar a prévia.</p></div></div>
+                      <form className="create-sheet-form gmail-compose-form" onSubmit={(event) => void createGmailPreview(event)}>
+                        <label>Para<input value={gmailTo} onChange={(event) => { setGmailTo(event.target.value); setGmailPreview(null); }} placeholder="destinatario@example.com" /></label>
+                        <label>CC<input value={gmailCc} onChange={(event) => { setGmailCc(event.target.value); setGmailPreview(null); }} /></label>
+                        <label>CCO<input value={gmailBcc} onChange={(event) => { setGmailBcc(event.target.value); setGmailPreview(null); }} /></label>
+                        <label>Assunto<input value={gmailSubject} onChange={(event) => { setGmailSubject(event.target.value); setGmailPreview(null); }} /></label>
+                        <label>Mensagem<textarea value={gmailBody} onChange={(event) => { setGmailBody(event.target.value); setGmailPreview(null); }} /></label>
+                        <button className="primary-button" type="submit" disabled={gmailBusy}>
+                          <Eye size={14} /> Preparar prévia
+                        </button>
+                      </form>
+                      {gmailPreview && (
+                        <div className="gmail-send-preview">
+                          <strong>Prévia — nenhum e-mail foi enviado</strong>
+                          <p><b>Para:</b> {gmailPreview.to}</p>
+                          {gmailPreview.cc && <p><b>CC:</b> {gmailPreview.cc}</p>}
+                          {gmailPreview.bcc && <p><b>CCO:</b> {gmailPreview.bcc}</p>}
+                          <p><b>Assunto:</b> {gmailPreview.subject}</p>
+                          <pre className="gmail-body-preview">{gmailPreview.body}</pre>
+                          <button className="primary-button gmail-confirm-send" disabled={gmailBusy} onClick={() => void confirmGmailSend()}>
+                            <Send size={14} /> Confirmar e enviar agora
+                          </button>
+                        </div>
+                      )}
+                    </section>
+                  </div>
+                </>
+              )}
             </div>
           )}
         </section>
       </main>
     </div>
   );
-}
-
-function FutureCard({ icon: Icon, title, text }: { icon: LucideIcon; title: string; text: string }) {
-  return <div className="future-card"><Icon size={17} /><div><strong>{title}</strong><small>{text}</small></div><span>EM BREVE</span></div>;
 }
 
 export default App;

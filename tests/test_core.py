@@ -7,7 +7,12 @@ from unittest.mock import Mock, patch
 import requests
 
 from guilherme_ai import documents
-from guilherme_ai.assistant import AssistantError, chat
+from guilherme_ai.assistant import (
+    AssistantError,
+    WebSearchIntent,
+    _build_system_prompt,
+    chat,
+)
 from guilherme_ai.database import (
     add_memory,
     clear_history,
@@ -145,8 +150,49 @@ class DocumentTests(unittest.TestCase):
             with path.open("wb") as file:
                 writer.write(file)
             with patch.object(documents, "KNOWLEDGE_DIR", library):
-                with self.assertRaisesRegex(DocumentError, "OCR não é executado"):
+                with self.assertRaisesRegex(DocumentError, "Ative a opção de OCR"):
                     documents._read_document(path)
+
+    def test_image_only_pdf_can_use_opt_in_local_ocr(self):
+        from pypdf import PdfWriter
+
+        with tempfile.TemporaryDirectory() as temporary:
+            library = Path(temporary)
+            path = library / "scan.pdf"
+            writer = PdfWriter()
+            writer.add_blank_page(width=72, height=72)
+            with path.open("wb") as file:
+                writer.write(file)
+            with patch.object(documents, "KNOWLEDGE_DIR", library), patch.object(
+                documents, "_ocr_pdf", return_value={0: "texto reconhecido"}
+            ) as ocr:
+                self.assertEqual(documents._read_document(path, enable_ocr=True), "texto reconhecido")
+            ocr.assert_called_once_with(path, [0])
+
+    def test_opt_in_ocr_only_processes_pages_without_extractable_text(self):
+        class FakePage:
+            def __init__(self, text):
+                self.text = text
+
+            def extract_text(self):
+                return self.text
+
+        class FakeReader:
+            is_encrypted = False
+            pages = [FakePage("texto existente"), FakePage("")]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            library = Path(temporary)
+            path = library / "mixed.pdf"
+            path.write_bytes(b"pdf")
+            with patch.object(documents, "KNOWLEDGE_DIR", library), patch(
+                "pypdf.PdfReader", return_value=FakeReader()
+            ), patch.object(
+                documents, "_ocr_pdf", return_value={1: "texto reconhecido"}
+            ) as ocr:
+                text = documents._read_document(path, enable_ocr=True)
+            self.assertEqual(text, "texto existente\ntexto reconhecido")
+            ocr.assert_called_once_with(path, [1])
 
     def test_index_failure_preserves_previous_chunks(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -241,6 +287,23 @@ class CalculatorTests(unittest.TestCase):
 
 
 class AssistantTests(unittest.TestCase):
+    def test_system_prompt_includes_authoritative_local_datetime(self):
+        with patch(
+            "guilherme_ai.assistant.current_datetime_context",
+            return_value="2026-11-20T21:05-03:00 [America/Sao_Paulo]",
+        ):
+            prompt = _build_system_prompt([], [])
+
+        self.assertIn("2026-11-20T21:05-03:00", prompt)
+        self.assertIn("Não diga que uma data anterior a ela é futura.", prompt)
+        self.assertIn("Um rascunho Gmail não significa que a mensagem foi enviada.", prompt)
+        self.assertIn("só a confirmação explícita na interface pode enviar.", prompt)
+        self.assertIn(
+            "Não mencione a ausência de trechos da biblioteca "
+            "em assuntos que não dependem dela.",
+            prompt,
+        )
+
     def test_chat_persists_response_and_returns_sources(self):
         connection = connect_database(":memory:")
         source = {"source": "a.txt", "content": "texto", "score": 0.8}
@@ -249,6 +312,12 @@ class AssistantTests(unittest.TestCase):
         response.raise_for_status.return_value = None
         with patch("guilherme_ai.assistant.search_library", return_value=[source]), patch(
             "guilherme_ai.assistant.relevant_memories", return_value=[]
+        ), patch(
+            "guilherme_ai.assistant.classify_web_search_intent",
+            return_value=WebSearchIntent(required=False),
+        ), patch(
+            "guilherme_ai.assistant.web_search",
+            side_effect=AssertionError("stable question should not search"),
         ):
             result = chat(connection, "pergunta", post=Mock(return_value=response))
         self.assertEqual(result.answer, "Resposta [1]")
@@ -263,6 +332,9 @@ class AssistantTests(unittest.TestCase):
         response.raise_for_status.return_value = None
         with patch("guilherme_ai.assistant.search_library", return_value=[]) as search, patch(
             "guilherme_ai.assistant.relevant_memories", return_value=[]
+        ), patch(
+            "guilherme_ai.assistant.classify_web_search_intent",
+            return_value=WebSearchIntent(required=False),
         ):
             chat(
                 connection,
@@ -273,10 +345,39 @@ class AssistantTests(unittest.TestCase):
         search.assert_called_once_with(connection, "santidade divina")
         connection.close()
 
+    def test_chat_passes_web_search_results_to_the_model_as_tool_context(self):
+        connection = connect_database(":memory:")
+        source = {
+            "title": "Versão atual",
+            "url": "https://example.com/version",
+            "description": "Python 3.14.",
+        }
+        response = Mock()
+        response.json.return_value = {"message": {"content": "Python 3.14 [W1]."}}
+        response.raise_for_status.return_value = None
+        post = Mock(return_value=response)
+        with patch(
+            "guilherme_ai.assistant.classify_web_search_intent",
+            return_value=WebSearchIntent(required=True, query="latest Python"),
+        ), patch("guilherme_ai.assistant.web_search", return_value=[source]), patch(
+            "guilherme_ai.assistant.search_library", return_value=[]
+        ), patch("guilherme_ai.assistant.relevant_memories", return_value=[]):
+            result = chat(connection, "Qual a versão atual?", post=post)
+
+        model_messages = post.call_args.kwargs["json"]["messages"]
+        self.assertEqual(model_messages[-2]["tool_calls"][0]["function"]["name"], "web_search")
+        self.assertEqual(model_messages[-1]["role"], "tool")
+        self.assertIn("Python 3.14", model_messages[-1]["content"])
+        self.assertEqual(result.web_sources, [source])
+        connection.close()
+
     def test_chat_does_not_persist_failed_requests(self):
         connection = connect_database(":memory:")
         with patch("guilherme_ai.assistant.search_library", return_value=[]), patch(
             "guilherme_ai.assistant.relevant_memories", return_value=[]
+        ), patch(
+            "guilherme_ai.assistant.classify_web_search_intent",
+            return_value=WebSearchIntent(required=False),
         ):
             with self.assertLogs("guilherme_ai.assistant", level="ERROR"):
                 with self.assertRaises(AssistantError):

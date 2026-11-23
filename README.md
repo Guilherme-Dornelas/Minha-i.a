@@ -41,16 +41,18 @@ Abra `http://127.0.0.1:8000`. Também é possível iniciar os servidores de dese
 - Conversas com histórico separado e respostas em streaming.
 - Migração não destrutiva do histórico antigo para a conversa anterior.
 - Busca opcional na biblioteca, com fontes e similaridade exibidas.
-- Importação e indexação local de TXT e PDF com texto extraível, até 20 MB.
+- Pesquisa automática de informações atuais pelo SearXNG local, com links das fontes.
+- Integração Gmail opcional: pesquisar/listar e ler mensagens, preparar rascunhos e enviar somente após prévia e confirmação explícita.
+- Importação e indexação local de TXT e PDF até 20 MB; OCR opcional para PDFs digitalizados.
 - Gerenciamento de memórias e notas.
 - Calculadora aritmética segura e consulta da data/hora locais.
 - Resumo de CSV/XLSX (até 20 MB, 100 mil linhas por aba), com dados ausentes, duplicidades e estatísticas numéricas.
-- Criação de XLSX a partir de dados JSON, com validação, fórmulas limitadas e sem sobrescrever arquivos existentes.
-- Inventário local de projetos: identifica manifestos e extensões sem ler conteúdo de código nem executar arquivos.
+- Criação de XLSX com várias abas e gráficos automáticos quando há categorias e valores numéricos; validação, fórmulas limitadas e sem sobrescrever arquivos existentes.
+- Análise estática local de projetos: inventaria manifestos e extensões e verifica sintaxe Python sem executar código ou enviá-lo ao modelo.
 - Tema escuro/claro, layout responsivo e indicador de conexão/modelos.
 - Banco SQLite compartilhado com o aplicativo Python.
 
-A interface e a API são vinculadas ao loopback (`127.0.0.1`) e não foram feitas para exposição em rede pública. Documentos e dados permanecem locais. A aplicação não executa código contido em documentos nem envia o conteúdo da biblioteca a serviços externos.
+A interface e a API são vinculadas ao loopback (`127.0.0.1`) e não foram feitas para exposição em rede pública. Documentos e dados permanecem locais. Quando a pesquisa web é acionada, a consulta é enviada ao SearXNG configurado e aos mecanismos habilitados nessa instância; os trechos retornados são enviados ao Ollama local como contexto. A aplicação não executa código contido em documentos nem envia o conteúdo da biblioteca a serviços externos. Quando você pede uma operação Gmail, as mensagens solicitadas são obtidas pela API do Google e o conteúdo necessário à resposta é enviado somente ao Ollama local. Corpos de e-mail não são persistidos diretamente; a resposta gerada pode conter trechos e, como as demais respostas, fica no histórico da conversa.
 
 ## Execução leve
 
@@ -59,20 +61,20 @@ A interface e a API são vinculadas ao loopback (`127.0.0.1`) e não foram feita
 - Embeddings são solicitados apenas quando há documentos indexados e usam retenção curta (`30s`).
 - O comportamento final de RAM e velocidade depende da configuração do Ollama e do hardware.
 
-## Funcionalidades ainda pendentes
+## Limites e integrações pendentes
 
-- A criação de planilhas gera uma aba e não gera gráficos automaticamente; análises de projeto são inventário/recomendações heurísticas, não revisão de código.
-- Pesquisa na internet fica desativada para não enviar consultas sem autorização.
-- Gmail está pendente. Não há OAuth configurado; só será ativado após configuração e autorização manual, com escopo de leitura.
+- Análises de projeto oferecem inventário, recomendações heurísticas e verificação de sintaxe Python; não são revisão completa de código.
+- Pesquisa na internet usa o SearXNG local em `http://127.0.0.1:8080/search` por padrão. O JSON precisa estar habilitado no SearXNG. Configure `SEARXNG_URL` no `.env` se o endereço for diferente; não é necessária API Key. A busca automática é orientada por uma classificação estruturada local e por sinais explícitos de atualidade; o modelo também recebe a data e hora locais para interpretar referências temporais. Os resultados podem estar incompletos; confira as fontes.
+- Para ativar o Gmail, copie as variáveis Gmail do `.env.example` para `.env`, configure um cliente OAuth do tipo aplicativo para computador/web local no Google Cloud e cadastre `http://127.0.0.1:8000/api/gmail/oauth/callback` como URI de redirecionamento. Preencha `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` e `GMAIL_ALLOWED_EMAIL` (a conta autorizada); gere `GMAIL_TOKEN_ENCRYPTION_KEY` com `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"`. Reinicie `npm run dev` e conecte a conta na página Gmail. A conta autorizada é comparada com a lista permitida e os tokens são protegidos com AES-256-GCM no SQLite local. O consentimento pede apenas `gmail.readonly` e `gmail.send`; pesquisar, listar, ler e compor não envia mensagens. Um envio só ocorre ao revisar a prévia e clicar em “Confirmar e enviar agora”. A autorização OAuth e o envio real dependem da configuração local e não são testados pela suíte automatizada.
 - A voz permanece opcional e disponível apenas no terminal legado.
-- PDFs digitalizados como imagem não têm OCR automático.
+- OCR não é executado automaticamente. Para usá-lo, instale `requirements-ocr.txt`, instale o Tesseract OCR com os idiomas português e inglês e marque a opção na biblioteca; o processamento continua local e é limitado a 100 páginas por PDF.
 
 ## Terminal e interface antiga
 
 - Terminal Python: `python app.py` ou `./run.bat`.
 - Interface Streamlit anterior: `python -m streamlit run web_app.py --server.address 127.0.0.1` ou `./run-web.bat` (endereço `http://127.0.0.1:8501`).
 
-Comandos do terminal: `/ajuda`, `/indexar`, `/reindexar`, `/documentos`, `/remover ID`, `/lembrar texto`, `/memorias`, `/esquecer ID`, `/limpar`, `/calc expressão`, `/hora`, `/ferramentas`, `/resumir assunto`, `/nota texto`, `/notas`, `/apagar-nota ID` e `/voz`.
+Comandos do terminal: `/ajuda`, `/indexar`, `/reindexar`, `/documentos`, `/remover ID`, `/lembrar texto`, `/memorias`, `/esquecer ID`, `/limpar`, `/calc expressão`, `/hora`, `/pesquisar consulta`, `/ferramentas`, `/resumir assunto`, `/nota texto`, `/notas`, `/apagar-nota ID` e `/voz`.
 
 ## Dados e backup
 
@@ -86,4 +88,4 @@ npm test
 npm run build
 ```
 
-Os testes unitários não exigem Ollama; a conversa real e a indexação precisam do serviço local e dos modelos instalados.
+Os testes unitários não exigem Ollama nem SearXNG; a conversa real precisa dos modelos instalados, e a pesquisa integrada requer o SearXNG ativo com JSON habilitado.

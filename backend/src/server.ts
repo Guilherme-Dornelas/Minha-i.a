@@ -11,8 +11,16 @@ import {
   validateDocumentUpload,
   validateSpreadsheetUpload,
 } from "./validation.js";
+import { GmailService, type GmailTokenStore } from "./gmail.js";
 
 type WorkerResponse<T> = { ok: true; result: T } | { ok: false; error: string; status: number };
+type WebSource = { title: string; url: string; description: string };
+type GmailIntent = {
+  action: string;
+  query: string;
+  messageId: string;
+  maxResults: number;
+};
 
 const ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const OLLAMA_HOST = (process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434").replace(/\/+$/, "");
@@ -88,12 +96,232 @@ function worker<T>(payload: Record<string, unknown>): Promise<T> {
   });
 }
 
+const gmailTokenStore: GmailTokenStore = {
+  async load() {
+    const result = await worker<{ encryptedPayload: string | null }>({
+      action: "gmail_credentials_load",
+    });
+    return result.encryptedPayload;
+  },
+  async save(encryptedPayload) {
+    await worker({ action: "gmail_credentials_store", encryptedPayload });
+  },
+  async clear() {
+    await worker({ action: "gmail_credentials_delete" });
+  },
+};
+const gmailService = new GmailService(gmailTokenStore);
+
 function asyncRoute(
   handler: (request: Request, response: Response, next: NextFunction) => Promise<void>,
 ) {
   return (request: Request, response: Response, next: NextFunction) => {
     void handler(request, response, next).catch(next);
   };
+}
+
+function escapeMarkdownLinkText(value: string): string {
+  return value.replace(/[\\[\]]/g, "\\$&");
+}
+
+function appendWebReferences(answer: string, sources: WebSource[]): string {
+  if (sources.length === 0) return answer;
+  const references = sources.map((source, index) => {
+    const url = encodeURI(source.url).replace(/[()]/g, (character) => (
+      character === "(" ? "%28" : "%29"
+    ));
+    return `[W${index + 1}] [${escapeMarkdownLinkText(source.title)}](${url})`;
+  });
+  return `${answer}\n\nFontes pesquisadas:\n${references.join("\n")}`;
+}
+
+function requireSameOrigin(request: Request): void {
+  const origin = request.get("origin");
+  const allowed = new Set([
+    `http://127.0.0.1:${PORT}`,
+    `http://localhost:${PORT}`,
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+  ]);
+  if (!origin || !allowed.has(origin)) {
+    throw new HttpError("A solicitação Gmail precisa vir da interface local.", 403);
+  }
+}
+
+function requestRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpError("O corpo da solicitação é inválido.", 400);
+  }
+  return value as Record<string, unknown>;
+}
+
+function routeString(value: string | string[] | undefined, name: string): string {
+  if (typeof value !== "string") throw new HttpError(`${name} inválido.`, 400);
+  return value;
+}
+
+function optionalStringList(value: unknown, name: string): string | string[] | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "string") return value;
+  if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
+    return value;
+  }
+  throw new HttpError(`O campo ${name} deve ser texto ou uma lista de textos.`, 400);
+}
+
+function optionalHeader(value: unknown, name: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new HttpError(`O campo ${name} deve ser texto.`, 400);
+  return value;
+}
+
+async function loadGmailMessage(messageId: string): Promise<Record<string, unknown>> {
+  const raw = await gmailService.readMessage(messageId);
+  return worker<Record<string, unknown>>({
+    action: "gmail_parse_message",
+    message: raw,
+  });
+}
+
+async function runGmailIntent(
+  intent: GmailIntent,
+  question: string,
+): Promise<{ action: string; data: unknown; draft?: Record<string, string> } | null> {
+  if (intent.action === "none") return null;
+  if (!["status", "list", "search", "read", "compose", "reply", "send"].includes(intent.action)) {
+    throw new HttpError("O classificador retornou uma ação Gmail inválida.", 502);
+  }
+
+  try {
+    if (intent.action === "status") {
+      return { action: intent.action, data: await gmailService.status() };
+    }
+    if (intent.action === "list" || intent.action === "search") {
+      return {
+        action: intent.action,
+        data: await gmailService.listMessages(intent.query || "in:inbox", intent.maxResults),
+      };
+    }
+    if (intent.action === "read") {
+      let messageId = intent.messageId;
+      if (!messageId) {
+        const result = await gmailService.listMessages(intent.query || "in:inbox", 1);
+        messageId = result.messages[0]?.id ?? "";
+      }
+      if (!messageId) {
+        return { action: intent.action, data: { error: "Nenhuma mensagem corresponde à pesquisa." } };
+      }
+      return { action: intent.action, data: await loadGmailMessage(messageId) };
+    }
+    if (intent.action === "reply") {
+      let messageId = intent.messageId;
+      if (!messageId) {
+        const result = await gmailService.listMessages(intent.query || "in:inbox", 1);
+        messageId = result.messages[0]?.id ?? "";
+      }
+      if (!messageId) {
+        return { action: intent.action, data: { error: "Nenhuma mensagem corresponde à pesquisa." } };
+      }
+      const originalMessage = await loadGmailMessage(messageId);
+      const fromAddress = originalMessage.fromAddress;
+      if (typeof fromAddress !== "string" || !fromAddress.includes("@")) {
+        return {
+          action: intent.action,
+          data: { error: "Não foi possível identificar o endereço do remetente para responder." },
+        };
+      }
+      const generatedDraft = await worker<Record<string, string>>({
+        action: "gmail_compose",
+        prompt: question,
+        originalMessage,
+      });
+      const originalSubject = typeof originalMessage.subject === "string"
+        ? originalMessage.subject
+        : "";
+      const subject = originalSubject
+        ? (/^re:/i.test(originalSubject) ? originalSubject : `Re: ${originalSubject}`)
+        : generatedDraft.subject;
+      const references = [
+        originalMessage.references,
+        originalMessage.messageId,
+      ].filter((value): value is string => typeof value === "string" && value.length > 0).join(" ");
+      const draft: Record<string, string> = {
+        ...generatedDraft,
+        to: fromAddress,
+        subject,
+      };
+      if (typeof originalMessage.threadId === "string") draft.threadId = originalMessage.threadId;
+      if (typeof originalMessage.messageId === "string") draft.inReplyTo = originalMessage.messageId;
+      if (references) draft.references = references;
+      return { action: intent.action, data: { originalMessage }, draft };
+    }
+
+    const draft = await worker<Record<string, string>>({
+      action: "gmail_compose",
+      prompt: question,
+    });
+    return { action: intent.action, data: { preparedForReview: true }, draft };
+  } catch (error) {
+    if (
+      error instanceof HttpError
+      && [401, 403, 404, 503].includes(error.status)
+    ) {
+      return { action: intent.action, data: { error: error.message } };
+    }
+    throw error;
+  }
+}
+
+function appendGmailToolResult(
+  messages: Array<{ role: string; content: string; [key: string]: unknown }>,
+  result: { action: string; data: unknown; draft?: Record<string, string> },
+): void {
+  let data = result.data;
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    const record = data as Record<string, unknown>;
+    if (result.action === "read" && typeof record.body === "string") {
+      data = {
+        ...record,
+        body: record.body.slice(0, 12_000),
+        bodyTruncated: record.body.length > 12_000,
+      };
+    } else if (
+      result.action === "reply"
+      && record.originalMessage
+      && typeof record.originalMessage === "object"
+      && !Array.isArray(record.originalMessage)
+    ) {
+      const originalMessage = record.originalMessage as Record<string, unknown>;
+      const body = originalMessage.body;
+      data = {
+        ...record,
+        originalMessage: {
+          ...originalMessage,
+          ...(typeof body === "string"
+            ? { body: body.slice(0, 12_000), bodyTruncated: body.length > 12_000 }
+            : {}),
+        },
+      };
+    }
+  }
+  messages.push({
+    role: "assistant",
+    content: "",
+    tool_calls: [{
+      function: {
+        name: "gmail_operation",
+        arguments: { action: result.action },
+      },
+    }],
+  });
+  messages.push({
+    role: "tool",
+    content: JSON.stringify({
+      action: result.action,
+      data,
+      ...(result.draft ? { draft: result.draft } : {}),
+    }),
+  });
 }
 
 app.get("/api/health", asyncRoute(async (_request, response) => {
@@ -125,6 +353,92 @@ app.get("/api/health", asyncRoute(async (_request, response) => {
   });
 }));
 
+app.get("/api/gmail/status", asyncRoute(async (_request, response) => {
+  response.json(await gmailService.status());
+}));
+
+app.get("/api/gmail/oauth/start", asyncRoute(async (_request, response) => {
+  response.redirect(gmailService.startOAuth());
+}));
+
+app.get("/api/gmail/oauth/callback", asyncRoute(async (request, response) => {
+  const { code, state, error } = request.query;
+  if (typeof error === "string") {
+    throw new HttpError("A autorização Gmail foi recusada no Google.", 400);
+  }
+  if (typeof code !== "string" || typeof state !== "string") {
+    throw new HttpError("O retorno OAuth Gmail está incompleto.", 400);
+  }
+  await gmailService.finishOAuth(code, state);
+  const appUrl = process.env.NODE_ENV === "production"
+    ? `http://127.0.0.1:${PORT}`
+    : "http://127.0.0.1:5173";
+  response.redirect(`${appUrl}/?gmail=connected`);
+}));
+
+app.post("/api/gmail/disconnect", asyncRoute(async (request, response) => {
+  requireSameOrigin(request);
+  response.json(await gmailService.disconnect());
+}));
+
+app.get("/api/gmail/messages", asyncRoute(async (request, response) => {
+  const queryValue = request.query.q;
+  const limitValue = request.query.limit;
+  const pageTokenValue = request.query.pageToken;
+  if (queryValue !== undefined && typeof queryValue !== "string") {
+    throw new HttpError("O filtro Gmail é inválido.", 400);
+  }
+  if (limitValue !== undefined && typeof limitValue !== "string") {
+    throw new HttpError("A quantidade de e-mails é inválida.", 400);
+  }
+  const query = typeof queryValue === "string" ? queryValue : "in:inbox";
+  const limit = limitValue === undefined
+    ? 10
+    : typeof limitValue === "string" && /^\d+$/.test(limitValue)
+      ? Number(limitValue)
+      : Number.NaN;
+  const pageToken = typeof pageTokenValue === "string" ? pageTokenValue : undefined;
+  if (pageTokenValue !== undefined && pageToken === undefined) {
+    throw new HttpError("O token de paginação Gmail é inválido.", 400);
+  }
+  response.json(await gmailService.listMessages(query, limit, pageToken));
+}));
+
+app.get("/api/gmail/messages/:id", asyncRoute(async (request, response) => {
+  response.json(await loadGmailMessage(routeString(request.params.id, "Mensagem")));
+}));
+
+app.post("/api/gmail/send/preview", asyncRoute(async (request, response) => {
+  requireSameOrigin(request);
+  const body = requestRecord(request.body);
+  if (typeof body.subject !== "string" || typeof body.body !== "string") {
+    throw new HttpError("Informe o assunto e o corpo do e-mail.", 400);
+  }
+  const threadId = optionalHeader(body.threadId, "threadId");
+  const inReplyTo = optionalHeader(body.inReplyTo, "inReplyTo");
+  const references = optionalHeader(body.references, "references");
+  const preview = gmailService.createSendPreview({
+    to: optionalStringList(body.to, "Para") ?? "",
+    cc: optionalStringList(body.cc, "CC"),
+    bcc: optionalStringList(body.bcc, "CCO"),
+    subject: body.subject,
+    body: body.body,
+    ...(threadId !== undefined ? { threadId } : {}),
+    ...(inReplyTo !== undefined ? { inReplyTo } : {}),
+    ...(references !== undefined ? { references } : {}),
+  });
+  response.status(201).json(preview);
+}));
+
+app.post("/api/gmail/send/:previewId/confirm", asyncRoute(async (request, response) => {
+  requireSameOrigin(request);
+  const body = requestRecord(request.body);
+  response.json(await gmailService.confirmSend(
+    routeString(request.params.previewId, "Prévia"),
+    body.confirmed === true,
+  ));
+}));
+
 app.get("/api/conversations", asyncRoute(async (_request, response) => {
   response.json(await worker({ action: "conversations" }));
 }));
@@ -148,24 +462,36 @@ app.delete("/api/conversations/:id", asyncRoute(async (request, response) => {
 }));
 
 app.post("/api/chat", asyncRoute(async (request, response) => {
-  const { question, conversationId, useLibrary } = request.body as {
-    question?: unknown;
-    conversationId?: unknown;
-    useLibrary?: unknown;
-  };
+  const { question, conversationId, useLibrary, gmailMessageId } = requestRecord(request.body);
   if (typeof question !== "string" || question.trim().length === 0 || question.length > 4000) {
     throw new HttpError("Digite uma pergunta com até 4.000 caracteres.", 400);
   }
   if (typeof conversationId !== "number" || !Number.isInteger(conversationId) || conversationId < 1) {
     throw new HttpError("Selecione uma conversa válida.", 400);
   }
+  if (
+    gmailMessageId !== undefined
+    && (typeof gmailMessageId !== "string" || !/^[A-Za-z0-9_-]{1,200}$/.test(gmailMessageId))
+  ) {
+    throw new HttpError("Identificador de mensagem Gmail inválido.", 400);
+  }
 
   const prepared = await worker<{
     conversationId: number;
     question: string;
-    messages: Array<{ role: string; content: string }>;
+    messages: Array<{ role: string; content: string; [key: string]: unknown }>;
     sources: Array<{ source: string; content: string; score: number }>;
-  }>({ action: "prepare_chat", question, conversationId, useLibrary });
+    webSources: WebSource[];
+    gmailIntent: GmailIntent;
+  }>({
+    action: "prepare_chat",
+    question,
+    conversationId,
+    useLibrary,
+    ...(typeof gmailMessageId === "string" ? { gmailMessageId } : {}),
+  });
+  const gmailResult = await runGmailIntent(prepared.gmailIntent, prepared.question);
+  if (gmailResult) appendGmailToolResult(prepared.messages, gmailResult);
 
   const controller = new AbortController();
   response.on("close", () => {
@@ -230,6 +556,13 @@ app.post("/api/chat", asyncRoute(async (request, response) => {
     if (buffer.trim()) forwardLine(buffer);
     if (!answer.trim()) throw new Error("O modelo retornou uma resposta vazia.");
 
+    const answerWithWebReferences = appendWebReferences(answer, prepared.webSources);
+    if (answerWithWebReferences !== answer) {
+      const references = answerWithWebReferences.slice(answer.length);
+      answer = answerWithWebReferences;
+      response.write(`data: ${JSON.stringify({ token: references })}\n\n`);
+    }
+
     await worker({
       action: "save_chat",
       conversationId: prepared.conversationId,
@@ -240,6 +573,9 @@ app.post("/api/chat", asyncRoute(async (request, response) => {
       conversationId: prepared.conversationId,
       answer,
       sources: prepared.sources,
+      webSources: prepared.webSources,
+      gmailData: gmailResult?.data,
+      gmailDraft: gmailResult?.draft,
     })}\n\n`);
     response.end();
   } catch (error) {
@@ -310,7 +646,11 @@ app.post("/api/documents/upload", asyncRoute(async (request, response) => {
 }));
 
 app.post("/api/documents/index", asyncRoute(async (request, response) => {
-  response.json(await worker({ action: "index_document", filename: request.body.filename }));
+  response.json(await worker({
+    action: "index_document",
+    filename: request.body.filename,
+    enableOcr: request.body.enableOcr,
+  }));
 }));
 
 app.post("/api/documents/reindex", asyncRoute(async (_request, response) => {
@@ -387,8 +727,8 @@ app.get("/api/tools", (_request, response) => {
     { id: "datetime", name: "Data e hora locais", enabled: true },
     { id: "spreadsheet", name: "Análise e criação de planilhas", enabled: true },
     { id: "project", name: "Inventário de projetos", enabled: true },
-    { id: "web", name: "Pesquisa na internet", enabled: false, note: "Desativada por privacidade" },
-    { id: "email", name: "Gmail somente leitura", enabled: false, note: "Aguarda autorização manual" },
+    { id: "web_search", name: "Pesquisa na internet", enabled: true, note: "SearXNG local" },
+    { id: "email", name: "Gmail", enabled: gmailService.configured, note: "Leitura e envio com confirmação explícita" },
   ]);
 });
 
