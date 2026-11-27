@@ -140,6 +140,33 @@ class WebSearchTests(unittest.TestCase):
             "Qual é a versão mais recente do Python?",
         )
 
+    def test_explicit_search_cues_override_router_false_and_empty_query(self):
+        questions = (
+            "Pesquise na internet sobre energia solar.",
+            "Busque fontes oficiais sobre educação.",
+            "Procure informações online sobre saúde.",
+            "Consulte sites sobre turismo.",
+            "Pesquise e compare preços de notebooks.",
+        )
+        for question in questions:
+            response = Mock()
+            response.json.return_value = {
+                "message": {
+                    "content": json.dumps({
+                        "search_required": False,
+                        "query": "",
+                    }),
+                },
+            }
+            response.raise_for_status.return_value = None
+            with self.subTest(question=question):
+                result = classify_web_search_intent(
+                    question,
+                    post=Mock(return_value=response),
+                )
+                self.assertTrue(result.required)
+                self.assertEqual(result.query, question)
+
     def test_relative_weekday_forces_search_with_sao_paulo_date(self):
         response = Mock()
         response.json.return_value = {

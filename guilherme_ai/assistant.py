@@ -48,6 +48,14 @@ _FRESHNESS_CUE = re.compile(
     re.IGNORECASE,
 )
 
+_EXPLICIT_WEB_SEARCH_CUE = re.compile(
+    r"\b(?:pesquise\s+(?:na\s+internet|e\s+compare)|"
+    r"busque\s+(?:fontes?|dados?|informações?)\s+oficiais?|"
+    r"procure\s+(?:informações?|dados?|fontes?)\s+online|"
+    r"consulte\s+sites?)\b",
+    re.IGNORECASE,
+)
+
 _SEARCH_INTENT_FORMAT = {
     "type": "object",
     "properties": {
@@ -66,6 +74,10 @@ _SEARCH_INTENT_FORMAT = {
 
 def has_web_freshness_cue(question: str) -> bool:
     return bool(_FRESHNESS_CUE.search(question))
+
+
+def has_explicit_web_search_cue(question: str) -> bool:
+    return bool(_EXPLICIT_WEB_SEARCH_CUE.search(question))
 
 
 def classify_web_search_intent(
@@ -147,15 +159,25 @@ def classify_web_search_intent(
         raise AssistantError("O modelo retornou consultas relacionadas inválidas.")
 
     freshness_cue = has_web_freshness_cue(prompt)
+    explicit_web_search_cue = has_explicit_web_search_cue(prompt)
     relative_date_cue = any(
         not resolution.startswith("Data explícita ")
         for resolution in resolved_dates
     )
-    required = route["search_required"] or freshness_cue or relative_date_cue
+    required = (
+        route["search_required"]
+        or freshness_cue
+        or explicit_web_search_cue
+        or relative_date_cue
+    )
     if not required:
         return WebSearchIntent(required=False)
 
-    query = prompt if freshness_cue else route["query"].strip()
+    query = (
+        prompt
+        if freshness_cue or explicit_web_search_cue
+        else route["query"].strip()
+    )
     if not query or len(query) > 500:
         logger.warning("Consulta estruturada inválida; usando a pergunta como busca.")
         normalized_prompt = re.sub(r"\s+", " ", prompt)

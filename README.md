@@ -78,7 +78,7 @@ Comandos do terminal: `/ajuda`, `/indexar`, `/reindexar`, `/documentos`, `/remov
 
 ## Dados e backup
 
-O SQLite existente (`memory.db`) e a pasta `biblioteca` são preservados. A nova interface cria tabelas próprias sem apagar as tabelas antigas. Um backup pré-modernização foi criado em `backups/pre-modernization-20261117-2251/`.
+O SQLite existente (`memory.db`) e a pasta `biblioteca` são preservados localmente. O banco não é versionado; a nova interface cria tabelas próprias sem apagar as tabelas antigas. Um backup pré-modernização foi criado em `backups/pre-modernization-20261117-2251/`.
 
 ## Testes
 
