@@ -17,6 +17,7 @@
     "test": "tsx --test backend/test/*.test.ts"
   },
   "dependencies": {
+    "@google/genai": "^3.6.1",
     "dotenv": "^16.4.7",
     "express": "^5.1.0",
     "lucide-react": "^0.468.0",

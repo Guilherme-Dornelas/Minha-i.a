@@ -8,6 +8,8 @@ import {
   ChevronDown,
   CircleHelp,
   Clock3,
+  Cloud,
+  Computer,
   Copy,
   Download,
   Eye,
@@ -43,6 +45,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 type Page = "chat" | "library" | "memories" | "notes" | "tools" | "settings" | "email";
+type ChatProvider = "ollama" | "gemini";
 type WebSource = { title: string; url: string; description: string };
 type GmailStatus = { configured: boolean; connected: boolean; email: string | null };
 type GmailMessageSummary = {
@@ -95,6 +98,7 @@ type Message = {
   id: number | string;
   role: "user" | "assistant";
   content: string;
+  provider?: ChatProvider | null;
   sources?: Array<{ source: string; content: string; score: number }>;
   webSources?: WebSource[];
   gmailData?: GmailChatData;
@@ -175,6 +179,8 @@ function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [question, setQuestion] = useState("");
   const [useLibrary, setUseLibrary] = useState(true);
+  const [provider, setProvider] = useState<ChatProvider>("ollama");
+  const [allowPrivateContext, setAllowPrivateContext] = useState(false);
   const [ocrScans, setOcrScans] = useState(false);
   const [health, setHealth] = useState<Health | null>(null);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
@@ -336,10 +342,16 @@ function App() {
   const sendMessage = async (value: string, gmailMessageId?: string) => {
     const trimmed = value.trim();
     if (!trimmed || busy || !conversationId) return;
+    if (provider === "gemini" && gmailMessageId && !allowPrivateContext) {
+      setError("Para usar conteúdo do Gmail com Gemini, autorize o envio de contexto privado.");
+      return;
+    }
+    const sharePrivateContext = provider === "ollama" || allowPrivateContext;
     setError("");
     setNotice("");
     setQuestion("");
     setBusy(true);
+    if (provider === "gemini") setAllowPrivateContext(false);
     const userMessage: Message = { id: `user-${Date.now()}`, role: "user", content: trimmed };
     const assistantId = `assistant-${Date.now()}`;
     setMessages((current) => [
@@ -356,6 +368,8 @@ function App() {
           question: trimmed,
           conversationId,
           useLibrary,
+          provider,
+          allowPrivateContext: sharePrivateContext,
           ...(gmailMessageId ? { gmailMessageId } : {}),
         }),
       });
@@ -384,6 +398,7 @@ function App() {
           gmailData?: GmailChatData;
           gmailDraft?: GmailDraft;
           error?: string;
+          provider?: ChatProvider;
         };
         if (eventName === "error") throw new Error(event.error || "Falha ao gerar a resposta.");
         if (eventName === "done") {
@@ -392,6 +407,7 @@ function App() {
             ? {
               ...message,
               content: event.answer ?? message.content,
+              provider: event.provider,
               sources: event.sources,
               webSources: event.webSources,
               gmailData: event.gmailData,
@@ -844,8 +860,10 @@ function App() {
           </div>
           <div className="topbar-status">
             <span className={`status-dot ${health?.ollamaConnected ? "online" : "offline"}`} />
-            <span>{health?.ollamaConnected ? "Local e privado" : "Ollama desconectado"}</span>
-            <ShieldCheck size={15} className="shield-icon" />
+            <span>{provider === "gemini"
+              ? "Gemini · processamento na nuvem"
+              : health?.ollamaConnected ? "Ollama · local e privado" : "Ollama desconectado"}</span>
+            <ShieldCheck size={15} className={`shield-icon ${provider === "gemini" ? "cloud-selected" : ""}`} />
           </div>
           <button className="icon-button top-search" title="Pesquisar (em breve)" disabled><Search size={18} /></button>
         </header>
@@ -860,9 +878,11 @@ function App() {
                 {messages.length === 0 ? (
                   <div className="welcome-panel">
                     <div className="welcome-orb"><Sparkles size={22} /></div>
-                    <div className="eyebrow"><span className="eyebrow-line" /> ASSISTENTE LOCAL <span className="eyebrow-line" /></div>
+                    <div className="eyebrow"><span className="eyebrow-line" /> {provider === "gemini" ? "GEMINI · NUVEM" : "ASSISTENTE LOCAL"} <span className="eyebrow-line" /></div>
                     <h1>Como posso ajudar<br /><span>hoje?</span></h1>
-                    <p>Converse com sua assistente local ou consulte seus documentos com privacidade.</p>
+                    <p>{provider === "gemini"
+                      ? "Esta conversa será processada pelo Gemini na nuvem. Contexto privado só será compartilhado com sua autorização."
+                      : "Converse com sua assistente local ou consulte seus documentos com privacidade."}</p>
                     <div className="suggestion-grid">
                       <button onClick={() => void sendMessage("Explique em palavras simples como funciona a busca em documentos nesta assistente.")}>
                         <BookOpen size={17} /><span><b>Entender meus documentos</b><small>Faça perguntas sobre a biblioteca</small></span><ArrowUp size={15} />
@@ -880,9 +900,20 @@ function App() {
                           {message.role === "assistant" ? <Sparkles size={16} /> : <UserRound size={16} />}
                         </div>
                         <div className="message-body">
-                          <div className="message-label">{message.role === "assistant" ? "Guilherme AI" : "Você"}</div>
+                          <div className="message-label">
+                            {message.role === "assistant" ? "Guilherme AI" : "Você"}
+                            {message.role === "assistant" && message.provider === "ollama" && (
+                              <span className="provider-badge ollama-provider"><Computer size={12} /> Ollama · Local</span>
+                            )}
+                            {message.role === "assistant" && message.provider === "gemini" && (
+                              <span className="provider-badge gemini-provider"><Cloud size={12} /> Gemini · Nuvem</span>
+                            )}
+                            {message.role === "assistant" && !message.provider && !message.loading && (
+                              <span className="provider-badge unknown-provider"><CircleHelp size={12} /> Provedor não registrado</span>
+                            )}
+                          </div>
                           {message.loading && !message.content
-                            ? <div className="thinking"><span /><span /><span /><small>pensando localmente</small></div>
+                            ? <div className="thinking"><span /><span /><span /><small>{provider === "gemini" ? "conectando ao Gemini na nuvem" : "pensando localmente"}</small></div>
                             : <div className="markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown></div>}
                           {message.role === "assistant" && message.content && (
                             <div className="message-actions">
@@ -1006,6 +1037,23 @@ function App() {
                         </select>
                         <ChevronDown size={13} />
                       </label>
+                      <span className="composer-divider" />
+                      <label className="mode-select provider-select">
+                        <Sparkles size={14} />
+                        <select
+                          value={provider}
+                          onChange={(event) => {
+                            const nextProvider = event.target.value === "gemini" ? "gemini" : "ollama";
+                            setProvider(nextProvider);
+                            if (nextProvider === "ollama") setAllowPrivateContext(false);
+                          }}
+                          aria-label="Provedor de IA"
+                        >
+                          <option value="ollama">Ollama — Local</option>
+                          <option value="gemini">Gemini — Nuvem</option>
+                        </select>
+                        <ChevronDown size={13} />
+                      </label>
                     </div>
                     <div className="composer-right">
                       <span className="model-chip"><span /> {health?.chatModel ?? "guilherme-ai"}</span>
@@ -1016,7 +1064,24 @@ function App() {
                     </div>
                   </div>
                 </form>
-                <div className="composer-footnote"><ShieldCheck size={12} /> Suas conversas ficam neste computador <span>·</span> <span>Shift + Enter para nova linha</span></div>
+                {provider === "gemini" && (
+                  <div className="gemini-privacy">
+                    <p role="note">A mensagem será processada pela API Gemini na nuvem. A chave permanece no backend.</p>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={allowPrivateContext}
+                        onChange={(event) => setAllowPrivateContext(event.target.checked)}
+                      />
+                      Autorizar, nesta mensagem, o envio do histórico, memórias, biblioteca e conteúdo Gmail.
+                    </label>
+                  </div>
+                )}
+                <div className="composer-footnote">
+                  <ShieldCheck size={12} />
+                  {provider === "gemini" ? "Provedor selecionado: Gemini (nuvem)" : "Ollama local · suas conversas ficam neste computador"}
+                  <span>·</span><span>Shift + Enter para nova linha</span>
+                </div>
               </div>
             </>
           )}

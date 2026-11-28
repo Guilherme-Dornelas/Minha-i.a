@@ -12,6 +12,12 @@ import {
   validateSpreadsheetUpload,
 } from "./validation.js";
 import { GmailService, type GmailTokenStore } from "./gmail.js";
+import { resolveChatProvider } from "./chatProvider.js";
+import {
+  createGeminiContentStream,
+  GeminiApiError,
+  GeminiConfigurationError,
+} from "./gemini.js";
 
 type WorkerResponse<T> = { ok: true; result: T } | { ok: false; error: string; status: number };
 type WebSource = { title: string; url: string; description: string };
@@ -61,9 +67,11 @@ app.use((request, response, next) => {
 
 function worker<T>(payload: Record<string, unknown>): Promise<T> {
   return new Promise((resolve, reject) => {
+    const workerEnvironment = { ...process.env };
+    delete workerEnvironment.GEMINI_API_KEY;
     const child = spawn(pythonExecutable, ["-m", "guilherme_ai.web_worker"], {
       cwd: ROOT,
-      env: process.env,
+      env: workerEnvironment,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -175,6 +183,68 @@ function optionalHeader(value: unknown, name: string): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "string") throw new HttpError(`O campo ${name} deve ser texto.`, 400);
   return value;
+}
+
+async function createOllamaContentStream(
+  messages: Array<{ role: string; content: string; [key: string]: unknown }>,
+  signal: AbortSignal,
+): Promise<AsyncIterable<string>> {
+  const ollamaResponse = await fetch(`${OLLAMA_HOST}/api/chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: CHAT_MODEL,
+      messages,
+      stream: true,
+      keep_alive: MODEL_KEEP_ALIVE,
+      options: {
+        temperature: 0.3,
+        num_ctx: Number.isInteger(MAX_MODEL_CONTEXT_TOKENS)
+          && MAX_MODEL_CONTEXT_TOKENS > 0
+          ? MAX_MODEL_CONTEXT_TOKENS
+          : 4096,
+      },
+    }),
+    signal,
+  });
+  if (!ollamaResponse.ok || !ollamaResponse.body) {
+    const detail = await ollamaResponse.text();
+    throw new HttpError(
+      `O Ollama recusou a conversa (${ollamaResponse.status}): ${detail.slice(0, 500)}`,
+      502,
+    );
+  }
+
+  const reader = ollamaResponse.body.getReader();
+  return (async function* () {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const parseLine = (line: string): string => {
+      if (!line.trim()) return "";
+      const chunk = JSON.parse(line) as {
+        message?: { content?: string };
+        error?: string;
+      };
+      if (chunk.error) throw new Error(chunk.error);
+      return chunk.message?.content ?? "";
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const text = parseLine(line);
+        if (text) yield text;
+      }
+      if (done) break;
+    }
+    if (buffer.trim()) {
+      const text = parseLine(buffer);
+      if (text) yield text;
+    }
+  })();
 }
 
 async function loadGmailMessage(messageId: string): Promise<Record<string, unknown>> {
@@ -464,7 +534,19 @@ app.delete("/api/conversations/:id", asyncRoute(async (request, response) => {
 }));
 
 app.post("/api/chat", asyncRoute(async (request, response) => {
-  const { question, conversationId, useLibrary, gmailMessageId } = requestRecord(request.body);
+  const {
+    question,
+    conversationId,
+    useLibrary,
+    gmailMessageId,
+    provider: requestedProvider,
+    allowPrivateContext,
+  } = requestRecord(request.body);
+  const provider = resolveChatProvider(requestedProvider);
+  if (allowPrivateContext !== undefined && typeof allowPrivateContext !== "boolean") {
+    throw new HttpError("A autorização de contexto privado é inválida.", 400);
+  }
+  const privateContextAuthorized = provider === "ollama" || allowPrivateContext === true;
   if (typeof question !== "string" || question.trim().length === 0 || question.length > 4000) {
     throw new HttpError("Digite uma pergunta com até 4.000 caracteres.", 400);
   }
@@ -476,6 +558,12 @@ app.post("/api/chat", asyncRoute(async (request, response) => {
     && (typeof gmailMessageId !== "string" || !/^[A-Za-z0-9_-]{1,200}$/.test(gmailMessageId))
   ) {
     throw new HttpError("Identificador de mensagem Gmail inválido.", 400);
+  }
+  if (provider === "gemini" && !privateContextAuthorized && gmailMessageId !== undefined) {
+    throw new HttpError(
+      "Autorize o envio de contexto privado para usar uma mensagem Gmail com Gemini.",
+      403,
+    );
   }
 
   const prepared = await worker<{
@@ -489,10 +577,23 @@ app.post("/api/chat", asyncRoute(async (request, response) => {
     action: "prepare_chat",
     question,
     conversationId,
-    useLibrary,
+    useLibrary: privateContextAuthorized && useLibrary !== false,
+    includePrivateContext: privateContextAuthorized,
     ...(typeof gmailMessageId === "string" ? { gmailMessageId } : {}),
   });
-  const gmailResult = await runGmailIntent(prepared.gmailIntent, prepared.question);
+  if (
+    provider === "gemini"
+    && !privateContextAuthorized
+    && prepared.gmailIntent.action !== "none"
+  ) {
+    throw new HttpError(
+      "Esta solicitação requer acesso ao Gmail. Ative a autorização de contexto privado para continuar.",
+      403,
+    );
+  }
+  const gmailResult = privateContextAuthorized
+    ? await runGmailIntent(prepared.gmailIntent, prepared.question)
+    : null;
   if (gmailResult) appendGmailToolResult(prepared.messages, gmailResult);
 
   const controller = new AbortController();
@@ -501,25 +602,9 @@ app.post("/api/chat", asyncRoute(async (request, response) => {
   });
 
   try {
-    const ollamaResponse = await fetch(`${OLLAMA_HOST}/api/chat`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model: CHAT_MODEL,
-        messages: prepared.messages,
-        stream: true,
-        keep_alive: MODEL_KEEP_ALIVE,
-        options: { temperature: 0.3, num_ctx: Number.isInteger(MAX_MODEL_CONTEXT_TOKENS) && MAX_MODEL_CONTEXT_TOKENS > 0 ? MAX_MODEL_CONTEXT_TOKENS : 4096 },
-      }),
-      signal: controller.signal,
-    });
-    if (!ollamaResponse.ok || !ollamaResponse.body) {
-      const detail = await ollamaResponse.text();
-      throw new HttpError(
-        `O Ollama recusou a conversa (${ollamaResponse.status}): ${detail.slice(0, 500)}`,
-        502,
-      );
-    }
+    const tokenStream = provider === "gemini"
+      ? await createGeminiContentStream(prepared.messages, { signal: controller.signal })
+      : await createOllamaContentStream(prepared.messages, controller.signal);
 
     response.status(200);
     response.setHeader("content-type", "text/event-stream; charset=utf-8");
@@ -527,35 +612,11 @@ app.post("/api/chat", asyncRoute(async (request, response) => {
     response.setHeader("connection", "keep-alive");
     response.flushHeaders();
 
-    const decoder = new TextDecoder();
-    const reader = ollamaResponse.body.getReader();
-    let buffer = "";
     let answer = "";
-
-    const forwardLine = (line: string) => {
-      if (!line.trim()) return;
-      const chunk = JSON.parse(line) as {
-        message?: { content?: string };
-        error?: string;
-        done?: boolean;
-      };
-      if (chunk.error) throw new Error(chunk.error);
-      const token = chunk.message?.content ?? "";
-      if (token) {
-        answer += token;
-        response.write(`data: ${JSON.stringify({ token })}\n\n`);
-      }
-    };
-
-    while (true) {
-      const { value, done } = await reader.read();
-      buffer += decoder.decode(value, { stream: !done });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) forwardLine(line);
-      if (done) break;
+    for await (const token of tokenStream) {
+      answer += token;
+      response.write(`data: ${JSON.stringify({ token })}\n\n`);
     }
-    if (buffer.trim()) forwardLine(buffer);
     if (!answer.trim()) throw new Error("O modelo retornou uma resposta vazia.");
 
     const answerWithWebReferences = appendWebReferences(answer, prepared.webSources);
@@ -570,10 +631,12 @@ app.post("/api/chat", asyncRoute(async (request, response) => {
       conversationId: prepared.conversationId,
       question: prepared.question,
       answer,
+      provider,
     });
     response.write(`event: done\ndata: ${JSON.stringify({
       conversationId: prepared.conversationId,
       answer,
+      provider,
       sources: prepared.sources,
       webSources: prepared.webSources,
       gmailData: gmailResult?.data,
@@ -588,6 +651,12 @@ app.post("/api/chat", asyncRoute(async (request, response) => {
       }
       response.end();
       return;
+    }
+    if (error instanceof GeminiConfigurationError) {
+      throw new HttpError(error.message, 503);
+    }
+    if (error instanceof GeminiApiError) {
+      throw new HttpError(error.message, 502);
     }
     throw error;
   }

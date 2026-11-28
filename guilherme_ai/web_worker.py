@@ -71,6 +71,7 @@ def _ensure_web_schema(connection: Any) -> None:
             conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
             role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
             content TEXT NOT NULL,
+            provider TEXT CHECK(provider IN ('ollama', 'gemini') OR provider IS NULL),
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS gmail_credentials (
@@ -80,6 +81,14 @@ def _ensure_web_schema(connection: Any) -> None:
         );
         """
     )
+    message_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(conversation_messages)")
+    }
+    if "provider" not in message_columns:
+        connection.execute(
+            "ALTER TABLE conversation_messages ADD COLUMN provider TEXT"
+        )
     cursor = connection.execute(
         """
         INSERT OR IGNORE INTO conversations (title, is_default)
@@ -199,7 +208,7 @@ def _run_action(request: dict[str, Any]) -> Any:
             _conversation_exists(connection, conversation_id)
             return _serialize_rows(connection.execute(
                 """
-                SELECT id, role, content, created_at
+                SELECT id, role, content, provider, created_at
                 FROM conversation_messages
                 WHERE conversation_id = ? ORDER BY id
                 """,
@@ -224,6 +233,9 @@ def _run_action(request: dict[str, Any]) -> Any:
             use_library = request.get("useLibrary", True)
             if not isinstance(use_library, bool):
                 raise ValueError("O modo da biblioteca é inválido.")
+            include_private_context = request.get("includePrivateContext", True)
+            if not isinstance(include_private_context, bool):
+                raise ValueError("A autorização de contexto privado é inválida.")
             conversation_id = _conversation_id(request)
             _conversation_exists(connection, conversation_id)
             prompt = question.strip()
@@ -239,15 +251,27 @@ def _run_action(request: dict[str, Any]) -> Any:
                 gmail_intent = classify_gmail_intent(prompt)
             web_sources = search_web_intent(search_intent, search=web_search)
             web_pages, fetch_errors = fetch_relevant_web_pages(prompt, web_sources)
-            sources = search_library(connection, prompt) if use_library else []
-            memories = relevant_memories(connection, prompt)
-            history = connection.execute(
-                """
-                SELECT role, content FROM conversation_messages
-                WHERE conversation_id = ? ORDER BY id DESC LIMIT ?
-                """,
-                (conversation_id, MAX_CONTEXT_MESSAGES),
-            ).fetchall()
+            sources = (
+                search_library(connection, prompt)
+                if use_library and include_private_context
+                else []
+            )
+            memories = (
+                relevant_memories(connection, prompt)
+                if include_private_context
+                else []
+            )
+            history = (
+                connection.execute(
+                    """
+                    SELECT role, content FROM conversation_messages
+                    WHERE conversation_id = ? ORDER BY id DESC LIMIT ?
+                    """,
+                    (conversation_id, MAX_CONTEXT_MESSAGES),
+                ).fetchall()
+                if include_private_context
+                else []
+            )
             messages = [{
                 "role": "system",
                 "content": _build_system_prompt(
@@ -292,18 +316,21 @@ def _run_action(request: dict[str, Any]) -> Any:
             conversation = _conversation_exists(connection, conversation_id)
             question = request.get("question")
             answer = request.get("answer")
+            provider = request.get("provider", "ollama")
             if not isinstance(question, str) or not isinstance(answer, str) or not answer:
                 raise ValueError("A resposta da conversa está incompleta.")
+            if not isinstance(provider, str) or provider not in {"ollama", "gemini"}:
+                raise ValueError("O provedor da resposta é inválido.")
             with connection:
                 connection.executemany(
                     """
                     INSERT INTO conversation_messages
-                        (conversation_id, role, content)
-                    VALUES (?, ?, ?)
+                        (conversation_id, role, content, provider)
+                    VALUES (?, ?, ?, ?)
                     """,
                     (
-                        (conversation_id, "user", question),
-                        (conversation_id, "assistant", answer),
+                        (conversation_id, "user", question, None),
+                        (conversation_id, "assistant", answer, provider),
                     ),
                 )
                 title = conversation["title"]

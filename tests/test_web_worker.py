@@ -66,6 +66,71 @@ class WebWorkerTests(unittest.TestCase):
             "Pergunta de teste",
         )
 
+    def test_chat_provider_is_persisted_on_its_assistant_message(self):
+        self._run({"action": "conversations"})
+        self._run({
+            "action": "save_chat",
+            "conversationId": 1,
+            "question": "Pergunta Gemini",
+            "answer": "Resposta Gemini",
+            "provider": "gemini",
+        })
+        self._run({
+            "action": "save_chat",
+            "conversationId": 1,
+            "question": "Pergunta local",
+            "answer": "Resposta local",
+            "provider": "ollama",
+        })
+
+        messages = self._run({"action": "messages", "conversationId": 1})
+        self.assertEqual(
+            [(message["role"], message["provider"]) for message in messages],
+            [
+                ("user", None),
+                ("assistant", "gemini"),
+                ("user", None),
+                ("assistant", "ollama"),
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "provedor"):
+            self._run({
+                "action": "save_chat",
+                "conversationId": 1,
+                "question": "Pergunta inválida",
+                "answer": "Resposta",
+                "provider": "unknown",
+            })
+
+    def test_existing_conversation_schema_migrates_provider_as_unknown(self):
+        connection = self._connect()
+        connection.executescript(
+            """
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO conversations (id, title, is_default) VALUES (1, 'Legada', 1);
+            CREATE TABLE conversation_messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO conversation_messages (conversation_id, role, content)
+            VALUES (1, 'assistant', 'Resposta antiga');
+            """
+        )
+        connection.close()
+
+        messages = self._run({"action": "messages", "conversationId": 1})
+        self.assertEqual(messages[0]["content"], "Resposta antiga")
+        self.assertIsNone(messages[0]["provider"])
+
     def test_chat_can_disable_library_retrieval(self):
         self._run({"action": "conversations"})
         with patch.object(web_worker, "search_library", side_effect=AssertionError("not expected")), patch.object(
@@ -88,6 +153,50 @@ class WebWorkerTests(unittest.TestCase):
         self.assertEqual(result["messages"][-1], {"role": "user", "content": "Pergunta geral"})
         self.assertEqual(result["webSources"], [])
         self.assertEqual(result["gmailIntent"]["action"], "none")
+
+    def test_prepare_chat_omits_private_history_memories_and_library_without_consent(self):
+        self._run({"action": "conversations"})
+        self._run({
+            "action": "save_chat",
+            "conversationId": 1,
+            "question": "Pergunta privada anterior",
+            "answer": "Resposta privada anterior",
+        })
+        with patch.object(
+            web_worker,
+            "classify_web_search_intent",
+            return_value=WebSearchIntent(required=False),
+        ), patch.object(
+            web_worker,
+            "classify_gmail_intent",
+            return_value=web_worker.GmailIntent("none"),
+        ), patch.object(
+            web_worker,
+            "search_library",
+            side_effect=AssertionError("library data must not be loaded"),
+        ), patch.object(
+            web_worker,
+            "relevant_memories",
+            side_effect=AssertionError("memories must not be loaded"),
+        ):
+            result = self._run({
+                "action": "prepare_chat",
+                "conversationId": 1,
+                "question": "Pergunta atual",
+                "useLibrary": True,
+                "includePrivateContext": False,
+            })
+
+        self.assertEqual(result["sources"], [])
+        self.assertEqual(result["messages"], [
+            {
+                "role": "system",
+                "content": result["messages"][0]["content"],
+            },
+            {"role": "user", "content": "Pergunta atual"},
+        ])
+        self.assertNotIn("Pergunta privada anterior", result["messages"][0]["content"])
+        self.assertNotIn("Resposta privada anterior", result["messages"][0]["content"])
 
     def test_prepare_chat_adds_web_results_to_context_and_returns_sources(self):
         self._run({"action": "conversations"})
