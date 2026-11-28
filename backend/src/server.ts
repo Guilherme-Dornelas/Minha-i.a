@@ -27,6 +27,8 @@ const OLLAMA_HOST = (process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434").replac
 const CHAT_MODEL = process.env.GUILHERME_AI_MODEL ?? "guilherme-ai";
 const EMBED_MODEL = process.env.GUILHERME_AI_EMBED_MODEL ?? "nomic-embed-text";
 const PORT = Number(process.env.GUILHERME_AI_PORT ?? 8000);
+const MODEL_KEEP_ALIVE = process.env.GUILHERME_AI_MODEL_KEEP_ALIVE ?? "2m";
+const MAX_MODEL_CONTEXT_TOKENS = Number(process.env.GUILHERME_AI_MAX_CONTEXT_TOKENS ?? 4096);
 const pythonInVenv = path.join(
   ROOT,
   ".venv",
@@ -506,8 +508,8 @@ app.post("/api/chat", asyncRoute(async (request, response) => {
         model: CHAT_MODEL,
         messages: prepared.messages,
         stream: true,
-        keep_alive: "2m",
-        options: { temperature: 0.3, num_ctx: 4096 },
+        keep_alive: MODEL_KEEP_ALIVE,
+        options: { temperature: 0.3, num_ctx: Number.isInteger(MAX_MODEL_CONTEXT_TOKENS) && MAX_MODEL_CONTEXT_TOKENS > 0 ? MAX_MODEL_CONTEXT_TOKENS : 4096 },
       }),
       signal: controller.signal,
     });

@@ -30,7 +30,12 @@ from guilherme_ai.documents import (
     resolve_library_file,
     split_text,
 )
-from guilherme_ai.tools import ToolError, calculate, extract_authorized_filename
+from guilherme_ai.tools import (
+    ToolError,
+    calculate,
+    create_registry,
+    extract_authorized_filename,
+)
 
 
 class DatabaseTests(unittest.TestCase):
@@ -284,6 +289,30 @@ class CalculatorTests(unittest.TestCase):
             with self.subTest(path=path):
                 with self.assertRaises(ToolError):
                     extract_authorized_filename(path)
+
+
+class ToolRegistryTests(unittest.TestCase):
+    def test_registry_has_canonical_names_aliases_and_permissions(self):
+        registry = create_registry()
+
+        tools = {tool.name: tool for tool in registry.available()}
+        self.assertEqual(set(tools), {
+            "calculadora",
+            "data_hora",
+            "web_search",
+            "web_fetch",
+        })
+        self.assertEqual(registry.execute("calculator", "2 + 2"), 4.0)
+        self.assertEqual(registry.execute("datetime", ""), tools["data_hora"].handler(""))
+
+        for name in ("web_search", "web_fetch"):
+            self.assertEqual(tools[name].origin, "internet")
+            self.assertEqual(tools[name].permission, "read")
+            self.assertFalse(tools[name].requires_confirmation)
+
+    def test_registry_rejects_unknown_tools(self):
+        with self.assertRaisesRegex(ToolError, "Ferramenta desconhecida"):
+            create_registry().execute("github", "")
 
 
 class AssistantTests(unittest.TestCase):

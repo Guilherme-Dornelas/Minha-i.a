@@ -407,21 +407,39 @@ def web_fetch(
 class Tool:
     name: str
     description: str
-    handler: Callable[[str], str]
+    handler: Callable[[str], object]
+    origin: str = "local"
+    permission: str = "read"
+    requires_confirmation: bool = False
+    aliases: tuple[str, ...] = ()
 
 
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        self._aliases: dict[str, str] = {}
 
     def register(self, tool: Tool) -> None:
         if tool.name in self._tools:
             raise ValueError(f"A ferramenta '{tool.name}' já está registrada.")
         self._tools[tool.name] = tool
+        for alias in tool.aliases:
+            if alias in self._aliases or alias in self._tools:
+                raise ValueError(f"O alias '{alias}' já está registrado.")
+            self._aliases[alias] = tool.name
 
     def run(self, name: str, argument: str = "") -> str:
+        result = self.execute(name, argument)
+        if isinstance(result, str):
+            return result
+        if isinstance(result, (dict, list)):
+            return json.dumps(result, ensure_ascii=False)
+        return str(result)
+
+    def execute(self, name: str, argument: str = "") -> object:
+        canonical_name = self._aliases.get(name, name)
         try:
-            tool = self._tools[name]
+            tool = self._tools[canonical_name]
         except KeyError as error:
             raise ToolError(f"Ferramenta desconhecida: {name}") from error
         return tool.handler(argument)
@@ -432,20 +450,31 @@ class ToolRegistry:
 
 def create_registry() -> ToolRegistry:
     registry = ToolRegistry()
-    registry.register(Tool("calculadora", "Avalia expressões aritméticas seguras.", lambda value: str(calculate(value))))
-    registry.register(Tool("data_hora", "Consulta a data e o horário locais.", lambda _: current_datetime()))
+    registry.register(Tool(
+        "calculadora",
+        "Avalia expressões aritméticas seguras.",
+        lambda value: calculate(value),
+        aliases=("calculator",),
+    ))
+    registry.register(Tool(
+        "data_hora",
+        "Consulta a data e o horário locais.",
+        lambda _: current_datetime(),
+        aliases=("datetime",),
+    ))
     registry.register(Tool(
         "web_search",
         "Pesquisa informações atuais usando o SearXNG local.",
-        lambda query: "\n".join(
-            f"{item['title']}\n{item['url']}\n{item['description']}"
-            for item in web_search(query)
-        ) or "Nenhum resultado foi encontrado.",
+        lambda query: web_search(query),
+        origin="internet",
+        permission="read",
     ))
     registry.register(Tool(
         "web_fetch",
         "Abre uma página HTTP(S) pública e extrai texto com proteção contra SSRF.",
-        lambda url: json.dumps(web_fetch(url), ensure_ascii=False),
+        lambda url: web_fetch(url),
+        origin="internet",
+        permission="read",
     ))
     return registry
 

@@ -30,6 +30,29 @@ WEB_FETCH_MAX_REDIRECTS = 3
 MAX_CONTEXT_MESSAGES = 6
 MAX_CONTEXT_MEMORIES = 5
 MAX_MEMORIES = 10
+MODEL_KEEP_ALIVE = os.environ.get("GUILHERME_AI_MODEL_KEEP_ALIVE", "2m")
+def _positive_environment_integer(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError as error:
+        raise ValueError(f"{name} deve ser um inteiro positivo.") from error
+    if value < 1:
+        raise ValueError(f"{name} deve ser um inteiro positivo.")
+    return value
+
+
+MAX_MODEL_CONTEXT_TOKENS = _positive_environment_integer(
+    "GUILHERME_AI_MAX_CONTEXT_TOKENS",
+    4096,
+)
+MAX_CLASSIFIER_CONTEXT_TOKENS = _positive_environment_integer(
+    "GUILHERME_AI_MAX_CLASSIFIER_CONTEXT_TOKENS",
+    2048,
+)
+MAX_RESOURCE_HISTORY_ROWS = _positive_environment_integer(
+    "GUILHERME_AI_MAX_RESOURCE_HISTORY_ROWS",
+    1000,
+)
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 120
 TOP_K = 4

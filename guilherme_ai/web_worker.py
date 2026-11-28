@@ -39,16 +39,19 @@ from .gmail import (
     validate_gmail_message_id,
 )
 from .tools import (
+    ToolError,
     WebSearchError,
     WebFetchError,
     calculate,
     current_datetime,
+    create_registry,
     extract_authorized_filename,
     web_fetch,
     web_search,
 )
 
 logger = logging.getLogger(__name__)
+TOOL_REGISTRY = create_registry()
 
 
 def _ensure_web_schema(connection: Any) -> None:
@@ -378,15 +381,12 @@ def _run_action(request: dict[str, Any]) -> Any:
         if action == "execute_tool":
             name = request.get("name")
             value = request.get("input", "")
-            if name == "calculator" and isinstance(value, str):
-                return {"result": calculate(value)}
-            if name == "datetime":
-                return {"result": current_datetime()}
-            if name == "web_search" and isinstance(value, str):
-                return {"result": web_search(value)}
-            if name == "web_fetch" and isinstance(value, str):
-                return {"result": web_fetch(value)}
-            raise ValueError("Ferramenta desconhecida ou entrada inválida.")
+            if not isinstance(name, str) or not isinstance(value, str):
+                raise ValueError("Ferramenta desconhecida ou entrada inválida.")
+            try:
+                return {"result": TOOL_REGISTRY.execute(name, value)}
+            except ToolError as error:
+                raise ValueError(str(error)) from error
 
         if action == "analyze_spreadsheet":
             filename = request.get("filename")

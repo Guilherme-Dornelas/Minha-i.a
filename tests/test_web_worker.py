@@ -220,7 +220,7 @@ class WebWorkerTests(unittest.TestCase):
             "url": "https://example.com",
             "description": "Resumo",
         }]
-        with patch.object(web_worker, "web_search", return_value=result_value) as search:
+        with patch("guilherme_ai.tools.web_search", return_value=result_value) as search:
             result = self._run({
                 "action": "execute_tool",
                 "name": "web_search",
@@ -232,7 +232,7 @@ class WebWorkerTests(unittest.TestCase):
 
     def test_web_fetch_tool_uses_the_shared_safe_fetcher(self):
         page = {"title": "Página", "url": "https://example.com", "publishedAt": "", "content": "Texto"}
-        with patch.object(web_worker, "web_fetch", return_value=page) as fetch:
+        with patch("guilherme_ai.tools.web_fetch", return_value=page) as fetch:
             result = self._run({
                 "action": "execute_tool",
                 "name": "web_fetch",

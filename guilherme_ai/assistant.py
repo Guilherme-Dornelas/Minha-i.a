@@ -8,7 +8,15 @@ from urllib.parse import urlsplit
 
 import requests
 
-from .config import CHAT_URL, MAX_CONTEXT_MESSAGES, MODEL, WEB_SEARCH_MAX_ALLOWED_RESULTS
+from .config import (
+    CHAT_URL,
+    MAX_CLASSIFIER_CONTEXT_TOKENS,
+    MAX_CONTEXT_MESSAGES,
+    MAX_MODEL_CONTEXT_TOKENS,
+    MODEL,
+    MODEL_KEEP_ALIVE,
+    WEB_SEARCH_MAX_ALLOWED_RESULTS,
+)
 from .database import load_history, relevant_memories, save_message
 from .documents import search_library
 from .time_context import current_datetime_context, resolve_relative_dates
@@ -120,8 +128,12 @@ def classify_web_search_intent(
                 ],
                 "format": _SEARCH_INTENT_FORMAT,
                 "stream": False,
-                "keep_alive": "2m",
-                "options": {"temperature": 0, "num_ctx": 2048, "num_predict": 128},
+                "keep_alive": MODEL_KEEP_ALIVE,
+                "options": {
+                    "temperature": 0,
+                    "num_ctx": MAX_CLASSIFIER_CONTEXT_TOKENS,
+                    "num_predict": 128,
+                },
             },
             timeout=30,
         )
@@ -454,8 +466,11 @@ def chat(
                 "model": MODEL,
                 "messages": messages,
                 "stream": False,
-                "keep_alive": "2m",
-                "options": {"temperature": 0.3, "num_ctx": 4096},
+                "keep_alive": MODEL_KEEP_ALIVE,
+                "options": {
+                    "temperature": 0.3,
+                    "num_ctx": MAX_MODEL_CONTEXT_TOKENS,
+                },
             },
             timeout=300,
         )
